@@ -4,3 +4,4 @@
 /Non-suppressed
 *.png
 sb.ipynb
+__pycache__
