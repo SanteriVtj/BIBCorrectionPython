@@ -44,3 +44,25 @@ def create_initial_grid(img, n_nodes):
             break
 
     return node_coords
+
+def create_layer(img, prev_layer, invards_step):
+    # Initialize array for nodes
+    node_coords = np.zeros(prev_layer.shape)
+
+    for i in range(1,prev_layer.shape[0]-1):
+        # Compute the angel at point i
+        u = (prev_layer[i-1,:]-prev_layer[i,:])
+        u = u / np.linalg.norm(u)
+        v = (prev_layer[i+1,:]-prev_layer[i,:])
+        v = v / np.linalg.norm(v)
+        # Direction vector 
+        w = u+v
+        w = w / np.linalg.norm(w)
+        # Take one step invards
+        node_coords[i,:] = np.int64(prev_layer[i]+invards_step*w)
+
+    # Step first and last nodes vertically
+    node_coords[0,:] = prev_layer[0,:]+invards_step*np.array([0,1])
+    node_coords[-1,:] = prev_layer[-1,:]-invards_step*np.array([0,1])
+
+    return node_coords
