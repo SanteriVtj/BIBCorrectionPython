@@ -182,7 +182,14 @@ def generate_pixel_perfect_paths(start_points, img_width):
         
     return discrete_paths
 
-def correction_field(M, paths, R, C):
+def correction_field(paths, img, **kwargs):
+    method = kwargs.get('method', 'linear')
+    k = kwargs.get('k', 3)
+    s = kwargs.get('s', None)
+
+    # Create rectified matrix
+    M = np.array([[img[x,y] for y, x in zip(*np.int64(path))] for path in paths])
+
     # 1. Calculate the average profile across all paths
     # M is our rectified matrix (rows = paths, cols = steps from skin to chest)
     average_profile = np.median(M, axis=0) 
@@ -200,7 +207,7 @@ def correction_field(M, paths, R, C):
     # "The polynomial order should be carefully selected" to avoid overcorrecting.
     # A low-order spline (e.g., k=3) ensures we don't dampen lesions.
     steps = np.arange(len(raw_correction))
-    spline = UnivariateSpline(steps, raw_correction, k=3, s=1.0)
+    spline = UnivariateSpline(steps, raw_correction, k=k, s=s)
     smooth_correction_1d = spline(steps)
 
     # Collect all (x, y) coordinates from your paths and their corresponding correction values
@@ -213,11 +220,14 @@ def correction_field(M, paths, R, C):
             values.append(smooth_correction_1d[j])
 
     # Interpolate to create the full 2D correction field C(x, y)
-    grid_y, grid_x = np.mgrid[0:R, 0:C]
-    correction_field_2d = griddata(points, values, (grid_x, grid_y), method='cubic', fill_value=1.0)
+    grid_y, grid_x = np.mgrid[0:img.shape[0], 0:img.shape[1]]
+    correction_field_2d = griddata(points, values, (grid_x, grid_y), method=method, fill_value=1.0)
     return correction_field_2d
 
-def uniform_spaced_paths(img, nx=10, ny=10):
+def uniform_spaced_paths(img, **kwargs):
+    nx = kwargs.get('nx', 10)
+    ny = kwargs.get('ny', 10)
+
     # Find starting points for the path
     boundary_nodes = create_initial_grid(img,ny)
 
@@ -225,19 +235,20 @@ def uniform_spaced_paths(img, nx=10, ny=10):
     paths = generate_normal_paths([(y, x) for x,y in boundary_nodes[1:-1,:]], img.shape[1]-1, num_steps=nx)
     paths = np.int64(paths)
 
-    # Create rectified matrix
-    M = np.array([[img[x,y] for y, x in zip(*np.int64(path))] for path in paths])
-
-    correction_field_2d = correction_field(M, paths, img.shape[0], img.shape[1])
+    correction_field_2d = correction_field(paths, img, **kwargs)
 
     # Apply the correction: I_corrected = I_RC * C
     corrected_image = img * correction_field_2d
 
     return corrected_image, correction_field_2d
 
-def distance_weighted_paths(img, nx=10, ny=10, height_weight=100):
+def distance_weighted_paths(img, **kwargs):
+    nx = kwargs.get('nx', 10)
+    ny = kwargs.get('ny', 10)
+    height_weight = kwargs.get('height_weight', 10)
+    
     # Find starting points for the path
-    boundary_nodes = create_initial_grid(img,ny)
+    boundary_nodes = create_initial_grid(img,ny+2)
 
     # Generate paths that are directed along the boundary normal
     paths = generate_pixel_perfect_paths([(y, x) for x,y in boundary_nodes[1:-1,:]], img.shape[1]-1)
@@ -250,7 +261,7 @@ def distance_weighted_paths(img, nx=10, ny=10, height_weight=100):
     path_points = []
     for path in paths3d:
         d = 0
-        distance = np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1))/10
+        distance = np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1))/(nx)
         sampled_path = []
         sampled_path.append(np.array([path[0][0],path[0][1]]))
         for i in range(len(path)-1):
@@ -263,12 +274,26 @@ def distance_weighted_paths(img, nx=10, ny=10, height_weight=100):
         sampled_path.append(np.array([path[-1][0],path[-1][1]]))
         path_points.append(sampled_path)
 
-    # Create rectified matrix
-    M = np.array([[img[x,y] for y, x in np.int64(path)] for path in path_points])
+    # format paths 
+    paths = [(np.reshape(np.concat(path), (-1,2))[:,0], np.reshape(np.concat(path), (-1,2))[:,1]) for path in path_points]
 
-    correction_field_2d = correction_field(M, paths, img.shape[0], img.shape[1])
+    correction_field_2d = correction_field(paths, img, **kwargs)
 
     # Apply the correction: I_corrected = I_RC * C
     corrected_image = img * correction_field_2d
 
     return corrected_image, correction_field_2d
+
+if __name__ == '__main__':
+    from pydicom import dcmread
+    import os
+
+    img_path = os.path.join("Processed", "I243")
+    print(img_path)
+
+    img = dcmread(img_path)
+    img = 1-(img.pixel_array-np.min(img.pixel_array))/(np.max(img.pixel_array)-np.min(img.pixel_array))
+    img[3095:,:] = np.zeros(img[3095:,:].shape)
+    mask = img!=0
+
+    weighted_corrected, weighted_field = distance_weighted_paths(img)
