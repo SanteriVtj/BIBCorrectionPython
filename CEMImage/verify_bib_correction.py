@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 # Load the example image
 print("Loading I248...")
-img = BIBCorrectedImage(dicom_path="I248")
+img = BIBCorrectedImage(dicom_path="../Processed/I248")
 print(f"Image shape: {img.pixel_array.shape}")
 print(f"Original intensity range: {np.min(img.pixel_array):.1f} - {np.max(img.pixel_array):.1f}")
 

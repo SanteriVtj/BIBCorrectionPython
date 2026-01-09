@@ -67,16 +67,19 @@ The library uses an **inheritance pattern** for extensibility:
 ```
 Image (base class)
 ├── smooth(), normalize(), invert()
-└── BIBCorrectedImage (subclass)
-    ├── segment_breast()
-    ├── compute_distance_transform()
-    ├── extract_distance_profile()
-    └── correct()
+├── BIBCorrectedImage (subclass)
+│   ├── segment_breast()
+│   └── correct() (Distance-based)
+└── PathCorrectedImage (subclass)
+    ├── generate_bezier_paths()
+    ├── sample_paths_adaptively()
+    └── correct() (Path-based)
 ```
 
 **Files:**
 - `image.py` - Base `Image` class with common operations
-- `bib_correction.py` - `BIBCorrectedImage` with BIB correction methods
+- `bib_correction.py` - `BIBCorrectedImage` with distance-based BIB correction
+- `path_correction.py` - `PathCorrectedImage` with geometry-aware path correction
 
 **Adding new correction methods:** Create a new subclass of `Image`:
 ```python
@@ -105,6 +108,17 @@ The correction models the BIB artifact as a function of **distance from the brea
 6. **Spline Smoothing**: $C_{smooth}(d) = \text{Spline}_k(C_{raw})$, clipped to $[0.5, 2.0]$
 7. **2D Mapping**: $C_{2D}(x,y) = C_{smooth}(d(x,y))$
 8. **Correction**: $I_{corrected} = I \cdot C_{2D}$
+
+### Path-Based Correction Algorithm
+Alternative geometry-aware correction preserving local features.
+
+1.  **Boundary Detection**: Identify skin boundary $\partial\Omega_{skin}$ and chest wall $\partial\Omega_{wall}$.
+2.  **Path Generation**: Construct non-overlapping Cubic Bezier curves $\gamma_i(t)$ from $\partial\Omega_{skin}$ to $\partial\Omega_{wall}$.
+    -   Start perpendicular to skin normal.
+    -   End perpendicular to chest wall (horizontal).
+3.  **Adaptive Sampling**: Sample points $p_{i,j}$ along paths.
+    -   Density: $\sim 1$ sample / 200px (Sparse sampling to preserve lesions).
+4.  **Correction Field**: Interpolate sparse correction factors $C(p_{i,j}) = I_{target} / I(p_{i,j})$ to 2D grid using cubic interpolation.
 
 ---
 
@@ -145,6 +159,28 @@ from bib_correction import BIBCorrectedImage
 
 **Returns:** `(corrected_image, correction_field_2d, profile_data)`
 
+### Subclass: `PathCorrectedImage` (path_correction.py)
+
+```python
+from path_correction import PathCorrectedImage
+```
+
+| Method | Description |
+|--------|-------------|
+| `generate_bezier_paths()` | Generates non-overlapping skin-to-wall paths |
+| `sample_paths_adaptively()` | Sparse sampling along paths |
+| `correct()` | Full path-based correction pipeline |
+
+**Parameters for `correct()`:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_paths` | 15 | Number of Bezier paths to generate. |
+| `min_samples` | 3 | Minimum samples per path (prevent overfitting). |
+| `max_samples` | 10 | Maximum samples per path. |
+| `smoothing_sigma` | 10 | Gaussian smoothing for final field. |
+
+**Returns:** `(corrected_image, correction_field_2d, paths, sample_points)`
+
 ---
 
 ## Examples
@@ -165,7 +201,21 @@ axes[1].set_title('Corrected')
 plt.show()
 ```
 
----
+### Path-Based Correction (Geometry-Aware)
+```python
+from path_correction import PathCorrectedImage
 
-## License
-MIT License
+img = PathCorrectedImage(dicom_path="I248")
+
+# Apply correction with sparse sampling (preserves lesions)
+corrected, field, paths, points = img.correct(
+    num_paths=15,
+    min_samples=3,
+    max_samples=10
+)
+
+# Visualize
+import matplotlib.pyplot as plt
+img.visualize_paths(paths, points)
+plt.show()
+```

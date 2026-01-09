@@ -6,7 +6,10 @@ class with breast-in-breast (BIB) artifact correction capabilities.
 """
 
 import numpy as np
-from .image import Image
+try:
+    from .image import Image
+except ImportError:
+    from image import Image
 
 
 class BIBCorrectedImage(Image):
@@ -171,7 +174,7 @@ class BIBCorrectedImage(Image):
         # 6. Map 1D correction back to 2D using distance transform
         correction_lookup = interp1d(
             bin_centers, smooth_correction,
-            kind='linear',
+            kind='cubic',
             fill_value=(smooth_correction[0], smooth_correction[-1]),
             bounds_error=False
         )
