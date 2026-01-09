@@ -73,7 +73,8 @@ Image (base class)
 └── PathCorrectedImage (subclass)
     ├── generate_bezier_paths()
     ├── sample_paths_adaptively()
-    └── correct() (Path-based)
+    ├── correct() (Heuristic)
+    └── correct_optimized() (Global Optimization)
 ```
 
 **Files:**
@@ -121,7 +122,8 @@ Alternative geometry-aware correction preserving local features.
     -   Detects the steepest gradient (tissue thickness change), skipping skin entrance.
     -   **Dense Sampling**: Around the detected edge (e.g. 10px step).
     -   **Sparse Sampling**: Deep tissue (e.g. 150px step) to preserve lesions.
-4.  **Correction Field**: Interpolate sparse correction factors $C(p_{i,j}) = I_{target} / I(p_{i,j})$ to 2D grid using cubic interpolation.
+4.  **Correction Field (Heuristic)**: Interpolate sparse correction factors $C(p_{i,j}) = I_{target} / I(p_{i,j})$ to 2D grid using cubic interpolation.
+5.  **Global Optimization (Alternative)**: Minimize $J(\theta) = \sigma(I_{corrected}) + \lambda \|\theta - 1\|^2$ where $\theta$ are correction factors at sample points.
 
 ---
 
@@ -168,20 +170,26 @@ from bib_correction import BIBCorrectedImage
 from path_correction import PathCorrectedImage
 ```
 
-| Method | Description |
-|--------|-------------|
 | `generate_bezier_paths()` | Generates non-overlapping skin-to-wall paths |
 | `sample_paths_adaptively()` | Sparse sampling along paths |
-| `correct()` | Full path-based correction pipeline |
+| `correct()` | Heuristic path-based correction pipeline |
+| `correct_optimized()` | Optimization-based global correction |
 
 **Parameters for `correct()`:**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `num_paths` | 15 | Number of Bezier paths to generate. |
-| `dense_step` | 15 | Sampling step in high-gradient artifact region (px). |
-| `sparse_step` | 150 | Sampling step in low-gradient interior (px). |
+| `dense_step` | 100 | Sampling step in high-gradient artifact region (px). |
+| `sparse_step` | 300 | Sampling step in low-gradient interior (px). |
 | `gradient_window` | 50 | Window size around detected edge for dense sampling. |
 | `smoothing_sigma` | 10 | Gaussian smoothing for final field. |
+
+**Parameters for `correct_optimized()`:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_paths` | 15 | Number of Bezier paths to generate. |
+| `regularization_weight`| 1.0 | Strength of regularization (prevents over-correction). |
+| `downsample_factor` | 4 | Downsampling for optimization speed. |
 
 **Returns:** `(corrected_image, correction_field_2d, paths, sample_points)`
 
@@ -205,18 +213,19 @@ axes[1].set_title('Corrected')
 plt.show()
 ```
 
-### Path-Based Correction (Geometry-Aware)
+### Path-Based Correction (Heuristic vs Optimization)
 ```python
 from path_correction import PathCorrectedImage
 
 img = PathCorrectedImage(dicom_path="I248")
 
-# Apply correction with gradient-based sampling
-corrected, field, paths, points = img.correct(
+# Method A: Heuristic (Fast, Aggressive)
+corr_h, _, _, _ = img.correct(num_paths=15)
+
+# Method B: Optimization (Global Minimization)
+corr_opt, _, paths, points = img.correct_optimized(
     num_paths=15,
-    dense_step=10,      # High resolution at artifact edge
-    sparse_step=150,    # Low resolution in deep tissue
-    gradient_window=30  # Focus tightly on specific edge events
+    regularization_weight=0.5
 )
 
 # Visualize

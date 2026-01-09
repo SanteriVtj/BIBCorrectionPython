@@ -465,7 +465,7 @@ class PathCorrectedImage(Image):
         
         return field
 
-    def smooth_correction_field(self, field, sigma=10):
+    def smooth_correction_field(self, field, sigma=10, min_value=0.5, max_value=2.0):
         """
         Applies Gaussian smoothing to the correction field.
         
@@ -481,11 +481,11 @@ class PathCorrectedImage(Image):
         smoothed = gaussian_filter(field, sigma=sigma)
         
         # Clip to reasonable range
-        smoothed = np.clip(smoothed, 0.5, 2.0)
+        smoothed = np.clip(smoothed, min_value, max_value)
         
         return smoothed
 
-    def correct(self, num_paths=15, dense_step=15, sparse_step=150, gradient_window=50,
+    def correct(self, num_paths=15, dense_step=100, sparse_step=300, gradient_window=50,
                 interpolation='cubic', smoothing_sigma=10):
         """
         High-level method to correct using path-based interpolation.
@@ -530,6 +530,114 @@ class PathCorrectedImage(Image):
         field = self.smooth_correction_field(field, sigma=smoothing_sigma)
         
         # Apply correction
+        corrected_pixels = self.pixel_array * field
+        corrected_image = PathCorrectedImage(pixel_array=corrected_pixels)
+        
+        return corrected_image, field, paths, sample_points
+
+    def correct_optimized(self, num_paths=15, dense_step=100, sparse_step=300, gradient_window=50,
+                          smoothing_sigma=10, regularization_weight=1.0, downsample_factor=4):
+        """
+        Corrects image by optimizing correction factors to minimize intensity standard deviation.
+        
+        Args:
+            num_paths, dense_step, sparse_step, gradient_window: Sampling parameters
+            smoothing_sigma: Sigma for final field smoothing
+            regularization_weight: Weight for smoothness/drift penalty
+            downsample_factor: Factor to downsample image for faster optimization (default 4)
+            
+        Returns:
+            tuple: (corrected_image, correction_field, paths, sample_points)
+        """
+        from scipy.optimize import minimize
+        from scipy.interpolate import griddata
+        
+        # 1. Generate geometry (paths and sample points)
+        paths, mask = self.generate_bezier_paths(num_paths=num_paths)
+        if not paths:
+            return self.correct(num_paths) # Fallback
+            
+        sample_points = self.sample_paths_adaptively(
+            paths, dense_step=dense_step, sparse_step=sparse_step, gradient_window=gradient_window
+        )
+        
+        # Flatten sample points for optimization
+        all_points = np.vstack(sample_points)
+        n_points = len(all_points)
+        
+        # 2. Prepare data for optimization (Downsampled)
+        if downsample_factor > 1:
+            img_small = self.pixel_array[::downsample_factor, ::downsample_factor]
+            mask_small = mask[::downsample_factor, ::downsample_factor]
+            # Scale points to new coordinate system
+            opt_points = all_points / downsample_factor
+            rows_small, cols_small = img_small.shape
+            grid_r, grid_c = np.mgrid[0:rows_small, 0:cols_small]
+        else:
+            img_small = self.pixel_array
+            mask_small = mask
+            opt_points = all_points
+            rows_small, cols_small = img_small.shape
+            grid_r, grid_c = np.mgrid[0:rows_small, 0:cols_small]
+
+        # Initial guess: Use heuristic correction for a better starting point
+        print("Computing heuristic guess...")
+        all_pts_h, heuristic_factors = self.compute_correction_at_points(sample_points, mask)
+        initial_factors = heuristic_factors
+        
+        # Pre-compute masked image pixels for fast std calculation
+        valid_pixels = img_small[mask_small]
+        
+        # 3. Define Objective Function
+        def objective(factors):
+            # Constraint: Factors should stay reasonable (e.g. 0.5 to 2.0)
+            # Interpolate field (Linear is faster for optimization loop)
+            # griddata is still slow. Ideally we'd use pre-computed weights, 
+            # but griddata doesn't expose them. 
+            # Optimization: Use 'nearest' for speed during optimization? 
+            # Or assume locally smooth and just use subsampled grid?
+            # Let's use 'linear' on the small grid.
+            
+            field_small = griddata(opt_points, factors, (grid_r, grid_c), 
+                                  method='linear', fill_value=1.0)
+            
+            # Handle NaNs from convex hull issues (fill with nearest or 1.0)
+            field_small = np.nan_to_num(field_small, nan=1.0)
+            
+            # Apply correction
+            # Only need to calculate on masked pixels
+            field_masked = field_small[mask_small]
+            corrected_pixels = valid_pixels * field_masked
+            
+            # Metric: Standard Deviation
+            std_dev = np.std(corrected_pixels)
+            
+            # Regularization: Penalize deviation from 1.0 (drift) and high variance in factors
+            reg_drift = np.mean((factors - 1.0)**2)
+            reg_smooth = np.std(factors) # Encourage factors to be similar?
+            
+            # Total Loss
+            return std_dev + regularization_weight * reg_drift
+            
+        # 4. Run Optimization
+        # Bounds: Correction factors strictly between 0.1 and 5.0
+        bounds = [(0.1, 5.0) for _ in range(n_points)]
+        
+        print(f"Optimizing {n_points} variables on {img_small.shape} grid...")
+        result = minimize(objective, initial_factors, bounds=bounds, method='L-BFGS-B', 
+                          options={'maxiter': 100, 'ftol': 1e-4})
+                          
+        optimal_factors = result.x
+        print(f"Optimization finished: {result.message} (Iterations: {result.nit})")
+        
+        # 5. Apply Final Correction (Full Resolution)
+        # Use cubic interpolation for the final high-quality result
+        field = self.interpolate_correction_field(
+            all_points, optimal_factors, mask, method='cubic'
+        )
+        
+        field = self.smooth_correction_field(field, sigma=smoothing_sigma)
+        
         corrected_pixels = self.pixel_array * field
         corrected_image = PathCorrectedImage(pixel_array=corrected_pixels)
         
