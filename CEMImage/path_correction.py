@@ -46,8 +46,7 @@ class PathCorrectedImage(Image):
             raise ValueError("No pixel data available.")
         
         # Normalize for thresholding
-        img_normalized = (self.pixel_array - np.min(self.pixel_array)) / \
-                         (np.max(self.pixel_array) - np.min(self.pixel_array))
+        img_normalized = self.normalize().pixel_array
         
         if threshold is None:
             threshold = threshold_otsu(img_normalized)
@@ -268,15 +267,9 @@ class PathCorrectedImage(Image):
         t = np.linspace(0, 1, num_points)[:, np.newaxis]
         return (1-t)**3 * p0 + 3*(1-t)**2*t * p1 + 3*(1-t)*t**2 * p2 + t**3 * p3
 
-    def _quadratic_bezier(self, p0, p1, p2, num_points=100):
-        """Legacy quadratic bezier"""
-        t = np.linspace(0, 1, num_points)[:, np.newaxis]
-        
-        curve = (1 - t)**2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
-        
-        return curve
 
-    def sample_paths_adaptively(self, paths, dense_step=15, sparse_step=150, gradient_window=50):
+
+    def sample_paths_adaptively(self, paths, dense_step=100, sparse_step=300, gradient_window=50):
         """
         Samples points using a dynamic strategy based on intensity gradients.
         
@@ -306,7 +299,7 @@ class PathCorrectedImage(Image):
             cumulative = np.concatenate([[0], np.cumsum(lengths)])
             total_length = cumulative[-1]
             
-            # Resample at 5px resolution for analysis
+            # Resample the path at 5px resolution for analysis
             num_analysis_points = int(total_length / 5)
             if num_analysis_points < 10: 
                 sampled.append(path) # Too short
@@ -326,6 +319,7 @@ class PathCorrectedImage(Image):
             
             # Extract intensity profile
             coords = np.vstack((r_coords, c_coords))
+            # Interpolate the pixel values at analysis coordinates by picking the nearest pixel value to the coordinate value
             profile = scipy.ndimage.map_coordinates(self.pixel_array, coords, order=1, mode='nearest')
             
             # 2. Compute Gradient Magnitude (Robust)
@@ -335,7 +329,7 @@ class PathCorrectedImage(Image):
             
             # 3. Find the "Event" (Tissue Thickness Change)
             # Skip skin entrance (first 20px)
-            skip_skin_px = 20
+            skip_skin_px = 50
             skip_skin_idx = int(skip_skin_px / 5)
             # Limit search to first 400px
             search_limit_px = 400
@@ -356,26 +350,7 @@ class PathCorrectedImage(Image):
             dense_start_dist = analysis_t[dense_start_idx]
             dense_end_dist = analysis_t[dense_end_idx]
             
-            # DEBUG: Visualize first path
-            if len(sampled) == 0:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(10, 6))
-                plt.subplot(2, 1, 1)
-                plt.plot(analysis_t, profile, label='Raw Intensity', alpha=0.5)
-                plt.plot(analysis_t, profile_smooth, label='Smoothed (sigma=5)', linewidth=2)
-                plt.axvline(x=dense_start_dist, color='g', linestyle='--', label='Dense Start')
-                plt.axvline(x=dense_end_dist, color='r', linestyle='--', label='Dense End')
-                plt.legend()
-                plt.title(f'Profile Analysis (Peak Index: {peak_idx})')
-                
-                plt.subplot(2, 1, 2)
-                plt.plot(analysis_t, gradient, label='Gradient')
-                plt.axvline(x=analysis_t[peak_idx], color='k', linestyle=':', label='Detected Peak')
-                plt.legend()
-                plt.title('Gradient Magnitude')
-                plt.tight_layout()
-                plt.savefig('debug_profile.png')
-                plt.close()
+
 
             # 4. Generate Final Sample Points
             target_lengths = [0.0]
