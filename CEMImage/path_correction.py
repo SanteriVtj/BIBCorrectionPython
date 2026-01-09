@@ -276,40 +276,116 @@ class PathCorrectedImage(Image):
         
         return curve
 
-    def sample_paths_adaptively(self, paths, dense_dist=200, dense_step=20, sparse_step=150):
+    def sample_paths_adaptively(self, paths, dense_step=15, sparse_step=150, gradient_window=50):
         """
-        Samples points from paths using a non-uniform strategy:
-        - Dense sampling near the start (skin) to capture artifact edges.
-        - Sparse sampling deeper inside to preserve lesions.
+        Samples points using a dynamic strategy based on intensity gradients.
+        
+        Algorithm:
+        1. Sample path densely to extract an intensity profile.
+        2. Compute gradient of the profile to find "tissue thickness change".
+        3. Identify the region of highest change (the artifact edge).
+        4. Sample densely in this region, and sparsely elsewhere.
         
         Args:
-            paths: List of paths (Nx2).
-            dense_dist: Distance from start to use dense sampling (pixels).
-            dense_step: Step size in dense region (pixels).
-            sparse_step: Step size in sparse region (pixels).
+            paths: List of paths.
+            dense_step: Step size in high-gradient regions.
+            sparse_step: Step size in low-gradient regions.
+            gradient_window: Window size to search for the main edge event.
         """
+        import scipy.ndimage
+        
         sampled = []
         
         for path in paths:
             if len(path) < 2:
                 continue
                 
-            # Compute path length
+            # 1. Create a dense temporary profile for analysis
             diffs = np.diff(path, axis=0)
             lengths = np.linalg.norm(diffs, axis=1)
             cumulative = np.concatenate([[0], np.cumsum(lengths)])
             total_length = cumulative[-1]
             
-            # Generate target lengths with non-uniform spacing
+            # Resample at 5px resolution for analysis
+            num_analysis_points = int(total_length / 5)
+            if num_analysis_points < 10: 
+                sampled.append(path) # Too short
+                continue
+                
+            analysis_t = np.linspace(0, total_length, num_analysis_points)
+            
+            # Vectorized interpolation for analysis points
+            analysis_indices = np.searchsorted(cumulative, analysis_t) - 1
+            analysis_indices = np.clip(analysis_indices, 0, len(path) - 2)
+            
+            segment_t = (analysis_t - cumulative[analysis_indices]) / \
+                        (cumulative[analysis_indices+1] - cumulative[analysis_indices] + 1e-6)
+            
+            r_coords = path[analysis_indices, 0] * (1 - segment_t) + path[analysis_indices+1, 0] * segment_t
+            c_coords = path[analysis_indices, 1] * (1 - segment_t) + path[analysis_indices+1, 1] * segment_t
+            
+            # Extract intensity profile
+            coords = np.vstack((r_coords, c_coords))
+            profile = scipy.ndimage.map_coordinates(self.pixel_array, coords, order=1, mode='nearest')
+            
+            # 2. Compute Gradient Magnitude (Robust)
+            # Use heavy smoothing to find the "macro" artifact trend, ignoring local noise/lesions
+            profile_smooth = scipy.ndimage.gaussian_filter1d(profile, sigma=5) # Increased smoothing
+            gradient = np.abs(np.gradient(profile_smooth))
+            
+            # 3. Find the "Event" (Tissue Thickness Change)
+            # Skip skin entrance (first 20px)
+            skip_skin_px = 20
+            skip_skin_idx = int(skip_skin_px / 5)
+            # Limit search to first 400px
+            search_limit_px = 400
+            search_limit_idx = int(search_limit_px / 5) 
+            
+            valid_gradient = gradient[skip_skin_idx:min(len(gradient), search_limit_idx)]
+            
+            if len(valid_gradient) > 0:
+                peak_idx = np.argmax(valid_gradient) + skip_skin_idx
+            else:
+                peak_idx = 0
+                
+            # Define Dense Region: Peak +/- window
+            window_indices = int(gradient_window / 5)
+            dense_start_idx = max(0, peak_idx - window_indices)
+            dense_end_idx = min(len(analysis_t) - 1, peak_idx + window_indices + int(100/5)) 
+            
+            dense_start_dist = analysis_t[dense_start_idx]
+            dense_end_dist = analysis_t[dense_end_idx]
+            
+            # DEBUG: Visualize first path
+            if len(sampled) == 0:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(10, 6))
+                plt.subplot(2, 1, 1)
+                plt.plot(analysis_t, profile, label='Raw Intensity', alpha=0.5)
+                plt.plot(analysis_t, profile_smooth, label='Smoothed (sigma=5)', linewidth=2)
+                plt.axvline(x=dense_start_dist, color='g', linestyle='--', label='Dense Start')
+                plt.axvline(x=dense_end_dist, color='r', linestyle='--', label='Dense End')
+                plt.legend()
+                plt.title(f'Profile Analysis (Peak Index: {peak_idx})')
+                
+                plt.subplot(2, 1, 2)
+                plt.plot(analysis_t, gradient, label='Gradient')
+                plt.axvline(x=analysis_t[peak_idx], color='k', linestyle=':', label='Detected Peak')
+                plt.legend()
+                plt.title('Gradient Magnitude')
+                plt.tight_layout()
+                plt.savefig('debug_profile.png')
+                plt.close()
+
+            # 4. Generate Final Sample Points
             target_lengths = [0.0]
             current_dist = 0.0
             
             while current_dist < total_length:
-                # Decide step size based on current distance
-                if current_dist < dense_dist:
-                    step = dense_step
-                else:
-                    step = sparse_step
+                # Check if we are in dense region
+                is_dense = (current_dist >= dense_start_dist) and (current_dist <= dense_end_dist)
+                
+                step = dense_step if is_dense else sparse_step
                 
                 current_dist += step
                 if current_dist <= total_length:
@@ -317,23 +393,17 @@ class PathCorrectedImage(Image):
             
             target_lengths = np.array(target_lengths)
             
-            # Interpolate points at target lengths
-            sample_points = []
-            for target in target_lengths:
-                # Find segment containing this length
-                idx = np.searchsorted(cumulative, target) - 1
-                idx = np.clip(idx, 0, len(path) - 2)
-                
-                # Interpolate within segment
-                if cumulative[idx + 1] > cumulative[idx]:
-                    t = (target - cumulative[idx]) / (cumulative[idx + 1] - cumulative[idx])
-                else:
-                    t = 0
-                
-                point = path[idx] * (1 - t) + path[idx + 1] * t
-                sample_points.append(point)
+            # Interpolate final sample points
+            final_indices = np.searchsorted(cumulative, target_lengths) - 1
+            final_indices = np.clip(final_indices, 0, len(path) - 2)
             
-            sampled.append(np.array(sample_points))
+            t_final = (target_lengths - cumulative[final_indices]) / \
+                      (cumulative[final_indices+1] - cumulative[final_indices] + 1e-6)
+            
+            final_points = path[final_indices] * (1 - t_final)[:, np.newaxis] + \
+                           path[final_indices+1] * t_final[:, np.newaxis]
+                           
+            sampled.append(final_points)
         
         return sampled
 
@@ -440,16 +510,16 @@ class PathCorrectedImage(Image):
         
         return smoothed
 
-    def correct(self, num_paths=15, dense_dist=300, dense_step=30, sparse_step=200,
+    def correct(self, num_paths=15, dense_step=15, sparse_step=150, gradient_window=50,
                 interpolation='cubic', smoothing_sigma=10):
         """
         High-level method to correct using path-based interpolation.
         
         Args:
             num_paths: Number of Bezier curves to generate
-            dense_dist: Region near skin to sample densely (px)
-            dense_step: Sampling step in dense region (px)
-            sparse_step: Sampling step in interior region (px)
+            dense_step: Sampling step in high-gradient regions (px)
+            sparse_step: Sampling step in low-gradient regions (px)
+            gradient_window: Window size around gradient peak (px)
             interpolation: Interpolation method ('linear', 'cubic', 'nearest')
             smoothing_sigma: Gaussian smoothing sigma for final field
             
@@ -465,7 +535,7 @@ class PathCorrectedImage(Image):
         
         # Sample points adaptively
         sample_points = self.sample_paths_adaptively(
-            paths, dense_dist=dense_dist, dense_step=dense_step, sparse_step=sparse_step
+            paths, dense_step=dense_step, sparse_step=sparse_step, gradient_window=gradient_window
         )
         
         # Compute corrections at sample points

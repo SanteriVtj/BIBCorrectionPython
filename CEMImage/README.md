@@ -116,8 +116,11 @@ Alternative geometry-aware correction preserving local features.
 2.  **Path Generation**: Construct non-overlapping Cubic Bezier curves $\gamma_i(t)$ from $\partial\Omega_{skin}$ to $\partial\Omega_{wall}$.
     -   Start perpendicular to skin normal.
     -   End perpendicular to chest wall (horizontal).
-3.  **Adaptive Sampling**: Sample points $p_{i,j}$ along paths.
-    -   Density: $\sim 1$ sample / 200px (Sparse sampling to preserve lesions).
+3.  **Adaptive Sampling (Gradient-Based)**:
+    -   Analyzes intensity profile along each path (smoothed).
+    -   Detects the steepest gradient (tissue thickness change), skipping skin entrance.
+    -   **Dense Sampling**: Around the detected edge (e.g. 10px step).
+    -   **Sparse Sampling**: Deep tissue (e.g. 150px step) to preserve lesions.
 4.  **Correction Field**: Interpolate sparse correction factors $C(p_{i,j}) = I_{target} / I(p_{i,j})$ to 2D grid using cubic interpolation.
 
 ---
@@ -175,8 +178,9 @@ from path_correction import PathCorrectedImage
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `num_paths` | 15 | Number of Bezier paths to generate. |
-| `min_samples` | 3 | Minimum samples per path (prevent overfitting). |
-| `max_samples` | 10 | Maximum samples per path. |
+| `dense_step` | 15 | Sampling step in high-gradient artifact region (px). |
+| `sparse_step` | 150 | Sampling step in low-gradient interior (px). |
+| `gradient_window` | 50 | Window size around detected edge for dense sampling. |
 | `smoothing_sigma` | 10 | Gaussian smoothing for final field. |
 
 **Returns:** `(corrected_image, correction_field_2d, paths, sample_points)`
@@ -207,11 +211,12 @@ from path_correction import PathCorrectedImage
 
 img = PathCorrectedImage(dicom_path="I248")
 
-# Apply correction with sparse sampling (preserves lesions)
+# Apply correction with gradient-based sampling
 corrected, field, paths, points = img.correct(
     num_paths=15,
-    min_samples=3,
-    max_samples=10
+    dense_step=10,      # High resolution at artifact edge
+    sparse_step=150,    # Low resolution in deep tissue
+    gradient_window=30  # Focus tightly on specific edge events
 )
 
 # Visualize

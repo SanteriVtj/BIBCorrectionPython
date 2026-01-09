@@ -28,13 +28,13 @@ if paths:
 
 # Sampling is now handled inside correction or visualized later
 
-# Apply correction with weighted edge sampling
+# Apply correction with robust gradient-based sampling
 print("\nApplying path-based correction...")
 corrected, field, paths, sample_points = img.correct(
     num_paths=12, 
-    dense_dist=150,    # Focus on first 150px (typical artifact width)
-    dense_step=15,     # High fidelity at edge
-    sparse_step=200,   # Sparse interior
+    dense_step=10,      # High fidelity at edge
+    sparse_step=150,    # Sparse interior
+    gradient_window=30, # Narrower window (30px) since sigma=5 finds precise center
     interpolation='cubic',
     smoothing_sigma=15
 )
