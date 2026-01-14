@@ -128,7 +128,7 @@ class PathCorrectedImage(Image):
         
         return normals
 
-    def generate_bezier_paths(self, num_paths=15, path_length_factor=1.0):
+    def generate_bezier_paths(self, num_paths=15):
         """
         Generates non-overlapping Bezier paths that start normal to the skin
         and curb towards the image boundary (chest wall).
@@ -269,7 +269,7 @@ class PathCorrectedImage(Image):
 
 
 
-    def sample_paths_adaptively(self, paths, dense_step=100, sparse_step=300, gradient_window=50):
+    def sample_paths_adaptively(self, paths, dense_step=100, sparse_step=300, gradient_window=50, search_limit_px=750, skip_skin_px=50):
         """
         Samples points using a dynamic strategy based on intensity gradients.
         
@@ -328,11 +328,9 @@ class PathCorrectedImage(Image):
             gradient = np.abs(np.gradient(profile_smooth))
             
             # 3. Find the "Event" (Tissue Thickness Change)
-            # Skip skin entrance (first 20px)
-            skip_skin_px = 50
+            # Skip skin entrance
             skip_skin_idx = int(skip_skin_px / 5)
-            # Limit search to first 400px
-            search_limit_px = 400
+            # Limit search
             search_limit_idx = int(search_limit_px / 5) 
             
             valid_gradient = gradient[skip_skin_idx:min(len(gradient), search_limit_idx)]
@@ -382,7 +380,7 @@ class PathCorrectedImage(Image):
         
         return sampled
 
-    def compute_correction_at_points(self, sample_points, mask):
+    def compute_correction_at_points(self, sample_points, mask, min_value=0.5, max_value=2.0):
         """
         Computes correction factors at sampled points based on local intensity.
         
@@ -404,7 +402,7 @@ class PathCorrectedImage(Image):
         
         # Estimate target intensity from deep interior (high distance)
         max_dist = np.max(distances)
-        interior_mask = distances > 0.3 * max_dist
+        interior_mask = distances > 0.0 * max_dist
         target_intensity = np.median(self.pixel_array[interior_mask])
         
         all_points = []
@@ -424,7 +422,7 @@ class PathCorrectedImage(Image):
                     # Correction factor
                     if local_intensity > 0:
                         correction = target_intensity / local_intensity
-                        correction = np.clip(correction, 0.5, 2.0)
+                        correction = np.clip(correction, min_value, max_value)
                     else:
                         correction = 1.0
                     
@@ -536,7 +534,7 @@ class PathCorrectedImage(Image):
         return corrected_image, field, paths, sample_points
 
     def correct_optimized(self, num_paths=15, dense_step=100, sparse_step=300, gradient_window=50,
-                          smoothing_sigma=10, regularization_weight=1.0, downsample_factor=4):
+                          smoothing_sigma=10, regularization_weight=1.0, downsample_factor=4, field_bounds=(0.1, 5.0)):
         """
         Corrects image by optimizing correction factors to minimize intensity standard deviation.
         
@@ -599,7 +597,7 @@ class PathCorrectedImage(Image):
             # Let's use 'linear' on the small grid.
             
             field_small = griddata(opt_points, factors, (grid_r, grid_c), 
-                                  method='linear', fill_value=1.0)
+                                  method='cubic', fill_value=1.0)
             
             # Handle NaNs from convex hull issues (fill with nearest or 1.0)
             field_small = np.nan_to_num(field_small, nan=1.0)
@@ -621,7 +619,7 @@ class PathCorrectedImage(Image):
             
         # 4. Run Optimization
         # Bounds: Correction factors strictly between 0.1 and 5.0
-        bounds = [(0.1, 5.0) for _ in range(n_points)]
+        bounds = [field_bounds for _ in range(n_points)]
         
         print(f"Optimizing {n_points} variables on {img_small.shape} grid...")
         result = minimize(objective, initial_factors, bounds=bounds, method='L-BFGS-B', 
