@@ -45,8 +45,8 @@ class PathCorrectedImage(Image):
         if self.pixel_array is None:
             raise ValueError("No pixel data available.")
         
-        # Normalize for thresholding
-        img_normalized = self.normalize().pixel_array
+        # Normalize for thresholding (use copy to allow non-destructive)
+        img_normalized = self.copy().normalize().pixel_array
         
         if threshold is None:
             threshold = threshold_otsu(img_normalized)
@@ -267,8 +267,6 @@ class PathCorrectedImage(Image):
         t = np.linspace(0, 1, num_points)[:, np.newaxis]
         return (1-t)**3 * p0 + 3*(1-t)**2*t * p1 + 3*(1-t)*t**2 * p2 + t**3 * p3
 
-
-
     def sample_paths_adaptively(self, paths, dense_step=100, sparse_step=300, gradient_window=50, search_limit_px=750, skip_skin_px=50):
         """
         Samples points using a dynamic strategy based on intensity gradients.
@@ -320,12 +318,12 @@ class PathCorrectedImage(Image):
             # Extract intensity profile
             coords = np.vstack((r_coords, c_coords))
             # Interpolate the pixel values at analysis coordinates by picking the nearest pixel value to the coordinate value
-            profile = scipy.ndimage.map_coordinates(self.pixel_array, coords, order=1, mode='nearest')
+            profile = scipy.ndimage.map_coordinates(self.blurred_pixel_array, coords, order=1, mode='nearest')
             
             # 2. Compute Gradient Magnitude (Robust)
             # Use heavy smoothing to find the "macro" artifact trend, ignoring local noise/lesions
-            profile_smooth = scipy.ndimage.gaussian_filter1d(profile, sigma=5) # Increased smoothing
-            gradient = np.abs(np.gradient(profile_smooth))
+            # profile_smooth = scipy.ndimage.gaussian_filter1d(profile, sigma=5) # Increased smoothing
+            gradient = np.abs(np.gradient(profile))
             
             # 3. Find the "Event" (Tissue Thickness Change)
             # Skip skin entrance
@@ -588,14 +586,6 @@ class PathCorrectedImage(Image):
         
         # 3. Define Objective Function
         def objective(factors):
-            # Constraint: Factors should stay reasonable (e.g. 0.5 to 2.0)
-            # Interpolate field (Linear is faster for optimization loop)
-            # griddata is still slow. Ideally we'd use pre-computed weights, 
-            # but griddata doesn't expose them. 
-            # Optimization: Use 'nearest' for speed during optimization? 
-            # Or assume locally smooth and just use subsampled grid?
-            # Let's use 'linear' on the small grid.
-            
             field_small = griddata(opt_points, factors, (grid_r, grid_c), 
                                   method='cubic', fill_value=1.0)
             
@@ -612,7 +602,6 @@ class PathCorrectedImage(Image):
             
             # Regularization: Penalize deviation from 1.0 (drift) and high variance in factors
             reg_drift = np.mean((factors - 1.0)**2)
-            reg_smooth = np.std(factors) # Encourage factors to be similar?
             
             # Total Loss
             return std_dev + regularization_weight * reg_drift
@@ -626,6 +615,7 @@ class PathCorrectedImage(Image):
                           options={'maxiter': 100, 'ftol': 1e-4})
                           
         optimal_factors = result.x
+        loss = result.fun
         print(f"Optimization finished: {result.message} (Iterations: {result.nit})")
         
         # 5. Apply Final Correction (Full Resolution)
@@ -636,10 +626,13 @@ class PathCorrectedImage(Image):
         
         field = self.smooth_correction_field(field, sigma=smoothing_sigma)
         
+        # Create the corrected image and force the intensity to be equal to the original image
         corrected_pixels = self.pixel_array * field
+        intensity = np.sum(self.pixel_array)/np.sum(corrected_pixels)
+        corrected_pixels = intensity*corrected_pixels
         corrected_image = PathCorrectedImage(pixel_array=corrected_pixels)
         
-        return corrected_image, field, paths, sample_points
+        return corrected_image, field, paths, sample_points, loss
 
     def visualize_paths(self, paths=None, sample_points=None, ax=None):
         """
@@ -679,3 +672,78 @@ class PathCorrectedImage(Image):
         ax.axis('off')
         
         return ax
+
+    def visualize(self, save=False, num_paths=12, gradient_window=50, regularization_weight=0.01, downsample_factor=4, 
+                  figname='bib_correction_result.png'):
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+        corr_h, field_h, _, _ = self.correct(num_paths)
+
+        mask, _ = self.detect_boundary()
+        std_orig = np.std(self.pixel_array[mask])
+        std_h = np.std(corr_h.pixel_array[mask])
+        red_h = (std_orig - std_h) / std_orig * 100
+
+        print(f"Heuristic Std: {std_h:.3f} (Reduction: {red_h:.1f}%)")
+
+        # 2. Optimization Correction
+        print("\n[2] Running Optimization Correction...")
+        # Using same sampling parameters
+        corr_opt, field_opt, _, _, _ = self.correct_optimized(
+            num_paths,
+            regularization_weight=regularization_weight,
+            downsample_factor=downsample_factor
+        )
+
+        std_opt = np.std(corr_opt.pixel_array[mask])
+        print(std_orig.shape)
+        print(std_opt.shape)
+        red_opt = (std_orig - std_opt) / std_orig * 100
+
+        print(f"Optimized Std: {std_opt:.3f} (Reduction: {red_opt:.1f}%)")
+
+        # 3. Visualization
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+        # Row 1: Images
+        vmin, vmax = np.percentile(self.pixel_array, (1, 99))
+
+        axes[0, 0].imshow(self.pixel_array, cmap='gray', vmin=vmin, vmax=vmax)
+        axes[0, 0].set_title(f"Original (Std: {std_orig:.0f})")
+
+        axes[0, 1].imshow(corr_h.pixel_array, cmap='gray', vmin=vmin, vmax=vmax)
+        axes[0, 1].set_title(f"Heuristic (Red: {red_h:.1f}%)")
+
+        axes[0, 2].imshow(corr_opt.pixel_array, cmap='gray', vmin=vmin, vmax=vmax)
+        axes[0, 2].set_title(f"Optimized (Red: {red_opt:.1f}%)")
+
+        # Row 2: Fields
+        # axes[1, 0].axis('off')
+        paths, _ = self.generate_bezier_paths(num_paths)
+        sample_points = self.sample_paths_adaptively(paths, gradient_window=gradient_window)
+        self.visualize_paths(paths, sample_points, axes[1, 0])
+
+        vmin = np.min([np.min(field_h), np.min(field_opt)])
+        vmax = np.max([np.max(field_h), np.max(field_opt)])
+
+        divider = make_axes_locatable(axes[1,2])
+        cax = divider.append_axes('right', size='5%', pad=0.05)
+
+        # field_h_im = 
+        axes[1, 1].imshow(field_h, cmap='viridis', vmin=vmin, vmax=vmax)
+        # fig.colorbar(field_h_im, cax=[1,1])
+        axes[1, 1].set_title("Heuristic Field")
+
+        field_opt_im = axes[1, 2].imshow(field_opt, cmap='viridis', vmin=vmin, vmax=vmax)
+        fig.colorbar(field_opt_im, cax=cax)
+        axes[1, 2].set_title("Optimized Field")
+
+        for ax in axes.flat:
+            ax.axis('off')
+            
+        plt.tight_layout()
+        if save:
+            plt.savefig(figname, dpi=150)
+        else:
+            return axes
