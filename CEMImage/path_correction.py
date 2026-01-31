@@ -27,7 +27,18 @@ class PathCorrectedImage(Image):
     the breast geometry, allowing for more flexible correction than
     distance-based methods.
     """
-
+    def __init__(self, dicom_path=None, pixel_array=None, sigma=25, radius=50):
+        super().__init__(dicom_path=dicom_path, pixel_array=pixel_array)
+        self._blurred_pixel_array = None
+        self._sigma = sigma
+        self._radius = radius
+        
+    @property
+    def blurred_pixel_array(self):
+        if self._blurred_pixel_array is None:
+            self._blurred_pixel_array = self._normalized_gaussian(sigma=self._sigma, radius=self._radius)
+        return self._blurred_pixel_array
+        
     def detect_boundary(self, threshold=None):
         """
         Detects the breast boundary points.
@@ -74,7 +85,7 @@ class PathCorrectedImage(Image):
         boundary = max(contours, key=len)
         
         return mask, boundary
-
+    
     def compute_boundary_normals(self, boundary_points, smoothing=5, mask=None):
         """
         Computes inward-pointing normal vectors at boundary points.
@@ -341,7 +352,7 @@ class PathCorrectedImage(Image):
             # Define Dense Region: Peak +/- window
             window_indices = int(gradient_window / 5)
             dense_start_idx = max(0, peak_idx - window_indices)
-            dense_end_idx = min(len(analysis_t) - 1, peak_idx + window_indices + int(100/5)) 
+            dense_end_idx = min(len(analysis_t) - 1, peak_idx + window_indices + int(100/5))
             
             dense_start_dist = analysis_t[dense_start_idx]
             dense_end_dist = analysis_t[dense_end_idx]
@@ -747,3 +758,43 @@ class PathCorrectedImage(Image):
             plt.savefig(figname, dpi=150)
         else:
             return axes
+        
+    def _normalized_gaussian(self, sigma, radius):
+        """
+        Applies Normalized Convolution to ignore background zeros during smoothing.
+        
+        Strategy:
+        1. Shift image intensities to be strictly negative (val - peak).
+           This ensures that '0' can be uniquely used as the 'missing data' value
+           for the padding/background, distinct from dark tissue (which is negative).
+        2. Apply mask (background -> 0).
+        3. Blur signal and mask.
+        4. Normalize (Divide).
+        5. Shift back (+ peak).
+        """
+        import scipy.ndimage
+        
+        mask, _ = self.detect_boundary()
+        mask_float = mask.astype(float)
+        
+        peak = np.max(self.pixel_array)
+        shifted_image = self.pixel_array - peak 
+        
+        image_masked = shifted_image * mask_float
+        
+        blurred_image = scipy.ndimage.gaussian_filter(image_masked, sigma=sigma, radius=radius)
+        blurred_mask = scipy.ndimage.gaussian_filter(mask_float, sigma=sigma, radius=radius)
+        
+        result = np.zeros_like(blurred_image)
+        # Avoid division by zero
+        valid_indices = blurred_mask > 1e-4
+        result[valid_indices] = blurred_image[valid_indices] / blurred_mask[valid_indices]
+        
+        restored = result + peak
+        
+        sum_restored = np.sum(restored)
+        if sum_restored == 0:
+            return restored
+        
+        scale_factor = np.sum(self.pixel_array) / sum_restored
+        return restored * scale_factor

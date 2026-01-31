@@ -18,7 +18,7 @@ class Image:
     and can be subclassed to add specific correction algorithms.
     """
     
-    def __init__(self, dicom_path=None, pixel_array=None, sigma=25, radius=50):
+    def __init__(self, dicom_path=None, pixel_array=None):
         """
         Initialize the Image class.
         
@@ -36,8 +36,6 @@ class Image:
         else:
             raise ValueError("Either dicom_path or pixel_array must be provided.")
         
-        self.blurred_pixel_array = scipy.ndimage.gaussian_filter(self.pixel_array, sigma=sigma, radius=radius)
-
     def _load_dicom(self, path):
         """Loads a DICOM file."""
         try:
