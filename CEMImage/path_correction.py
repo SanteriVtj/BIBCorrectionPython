@@ -412,7 +412,7 @@ class PathCorrectedImage(Image):
         # Estimate target intensity from deep interior (high distance)
         max_dist = np.max(distances)
         interior_mask = distances > 0.0 * max_dist
-        target_intensity = np.median(self.pixel_array[interior_mask])
+        target_intensity = np.median(self.blurred_pixel_array[interior_mask])
         
         all_points = []
         all_corrections = []
@@ -426,7 +426,7 @@ class PathCorrectedImage(Image):
                     # Local intensity (use small neighborhood for robustness)
                     r_min, r_max = max(0, ri-2), min(rows, ri+3)
                     c_min, c_max = max(0, ci-2), min(cols, ci+3)
-                    local_intensity = np.median(self.pixel_array[r_min:r_max, c_min:c_max])
+                    local_intensity = np.median(self.blurred_pixel_array[r_min:r_max, c_min:c_max])
                     
                     # Correction factor
                     if local_intensity > 0:
@@ -635,7 +635,7 @@ class PathCorrectedImage(Image):
             all_points, optimal_factors, mask, method='cubic'
         )
         
-        field = self.smooth_correction_field(field, sigma=smoothing_sigma)
+        # field = self.smooth_correction_field(field, sigma=smoothing_sigma)
         
         # Create the corrected image and force the intensity to be equal to the original image
         corrected_pixels = self.pixel_array * field
@@ -797,4 +797,8 @@ class PathCorrectedImage(Image):
             return restored
         
         scale_factor = np.sum(self.pixel_array) / sum_restored
-        return restored * scale_factor
+        
+        # Enforce original boundary (fix "blooming" effect)
+        final_result = restored * scale_factor * mask_float 
+        
+        return final_result
