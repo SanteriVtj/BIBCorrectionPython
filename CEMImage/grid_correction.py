@@ -107,3 +107,4 @@ class GridCorrectedImage(Image):
             field[~mask] = 0
 
         return GridCorrectedImage(pixel_array=field*self.pixel_array), field, itp
+
