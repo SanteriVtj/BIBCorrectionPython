@@ -144,7 +144,10 @@ class PathCorrectedImage(Image):
         Generates non-overlapping Bezier paths that start normal to the skin
         and curb towards the image boundary (chest wall).
         """
+        from scipy.ndimage import distance_transform_edt, map_coordinates
+
         mask, boundary = self.detect_boundary()
+        distance_to_boundary = distance_transform_edt(mask)
         
         if len(boundary) == 0:
             return [], mask
@@ -269,7 +272,7 @@ class PathCorrectedImage(Image):
             
             path_in_mask = path[valid_mask]
             
-            if len(path_in_mask) > 10:
+            if (len(path_in_mask) > 10) and (np.median(map_coordinates(distance_to_boundary, path.T))>10):
                 paths.append(path_in_mask)
         
         return paths, mask
@@ -278,7 +281,7 @@ class PathCorrectedImage(Image):
         t = np.linspace(0, 1, num_points)[:, np.newaxis]
         return (1-t)**3 * p0 + 3*(1-t)**2*t * p1 + 3*(1-t)*t**2 * p2 + t**3 * p3
 
-    def sample_paths_adaptively(self, paths, method='greedy', error_threshold=0.015, max_points=25, 
+    def sample_paths_adaptively(self, paths, method='greedy', error_threshold=0.015, max_points=25, block_r=50,
                                 dense_step=100, sparse_step=300, gradient_window=50):
         """
         Samples points along paths.
@@ -293,7 +296,7 @@ class PathCorrectedImage(Image):
         else:
             return self._sample_paths_greedy(paths, error_threshold, max_points)
 
-    def _sample_paths_greedy(self, paths, error_threshold=0.015, max_points=25):
+    def _sample_paths_greedy(self, paths, error_threshold=0.015, max_points=25, block_r=50):
         """
         Greedy sampling: Iteratively adds points where linear interpolation error is highest.
         """
@@ -374,7 +377,7 @@ class PathCorrectedImage(Image):
             final_r = r_coords[indices]
             final_c = c_coords[indices]
             final_points = np.vstack((final_r, final_c)).T
-            
+
             sampled.append(final_points)
             
         return sampled
@@ -576,20 +579,45 @@ class PathCorrectedImage(Image):
         
         return smoothed
 
-    def _compute_rbf_matrix(self, source_points, target_points, kernel='thin_plate'):
+    def _normalize_coords(self, points, shape=None):
+        """Helper to normalize coordinates to [0, 1] range."""
+        if shape is None:
+            shape = self.pixel_array.shape
+        rows, cols = shape
+        # Ensure float64 to prevent in-place division error on int arrays
+        norm_points = points.astype(np.float64)
+        norm_points[:, 0] /= rows
+        norm_points[:, 1] /= cols
+        return norm_points
+
+    def _compute_rbf_matrix(self, source_points, target_points, kernel='thin_plate', domain_shape=None):
         """
         Computes the interpolation matrix M such that M @ values = interpolated_values.
         Uses Radial Basis Functions (TPS) for global smoothness.
+        Coordinates are normalized to [0, 1] for numerical stability.
+        Distance is scaled back to pixel units for Kernel conditioning.
         
         Args:
             source_points: (N, 2) control points.
             target_points: (M, 2) target coordinates.
             kernel: 'thin_plate', 'cubic', 'linear', or 'gaussian'.
+            domain_shape: (rows, cols) of the coordinate domain for normalization.
             
         Returns:
             np.ndarray: (M, N) dense matrix.
         """
         from scipy.spatial.distance import cdist
+        
+        # Normalize coordinates to unit square for numerical stability
+        # Use provided domain shape or default to full image
+        if domain_shape is None:
+            domain_shape = self.pixel_array.shape
+            
+        src_norm = self._normalize_coords(source_points, domain_shape)
+        tgt_norm = self._normalize_coords(target_points, domain_shape)
+        
+        # Scaling factor to keep kernel well-conditioned (approx pixel units)
+        scale = np.mean(domain_shape)
         
         # Kernel Functions
         def rbf_kernel(r, method='thin_plate', epsilon=1.0):
@@ -608,7 +636,8 @@ class PathCorrectedImage(Image):
                 
         # 1. Compute Kernel Matrix for Source Points (K_cc)
         # Add regularization to diagonal for stability
-        d_cc = cdist(source_points, source_points)
+        # Scale distances!
+        d_cc = cdist(src_norm, src_norm) * scale
         K_cc = rbf_kernel(d_cc, method=kernel)
         np.fill_diagonal(K_cc, K_cc.diagonal() + 1e-8) # Regularization
         
@@ -624,13 +653,88 @@ class PathCorrectedImage(Image):
             K_cc_inv = np.linalg.pinv(K_cc)
             
         # 3. Compute Kernel Matrix for Target Points (K_tc)
-        d_tc = cdist(target_points, source_points)
+        d_tc = cdist(tgt_norm, src_norm) * scale
         K_tc = rbf_kernel(d_tc, method=kernel)
         
         # 4. Compute Final Matrix M
         M = K_tc @ K_cc_inv
         
         return M
+
+    def _predict_rbf_field(self, source_points, values, target_shape, kernel='thin_plate'):
+        """
+        Generates full-resolution field using RBF interpolation (memory efficient).
+        Field(x) = sum( w_i * phi(|x - c_i|) )
+        Coordinates are normalized to [0, 1] for numerical stability.
+        
+        Args:
+            source_points: (N, 2) control points
+            values: (N,) values at control points
+            target_shape: (rows, cols) shape of output field
+            kernel: 'thin_plate'
+            
+        Returns:
+            np.ndarray: (rows, cols) field
+        """
+        from scipy.spatial.distance import cdist
+        
+        rows, cols = target_shape
+        N = len(source_points)
+        
+        # Use full resolution domain for scaling
+        domain_shape = self.pixel_array.shape
+        scale = np.mean(domain_shape)
+        
+        # Normalize source points to [0, 1] using original image shape
+        # (This assumes source_points are in pixel coordinates of the original image)
+        src_norm = self._normalize_coords(source_points, domain_shape)
+        
+        # 1. Solve for RBF weights (alpha)
+        # K_cc * alpha = values  ->  alpha = K_cc_inv * values
+        # Scale distances!
+        d_cc = cdist(src_norm, src_norm) * scale
+        
+        if kernel == 'thin_plate':
+            K_cc = np.where(d_cc == 0, 0, d_cc**2 * np.log(d_cc + 1e-10))
+        else:
+            K_cc = d_cc 
+            
+        np.fill_diagonal(K_cc, K_cc.diagonal() + 1e-8)
+        
+        try:
+            alpha = np.linalg.solve(K_cc, values)
+        except np.linalg.LinAlgError:
+            alpha = np.linalg.lstsq(K_cc, values, rcond=None)[0]
+            
+        # 2. Generate Field (Accumulate contributions)
+        field = np.zeros(target_shape, dtype=np.float32)
+        
+        # We need normalized grid coordinates for the target shape
+        # grid_r = y / rows, grid_c = x / cols
+        grid_r, grid_c = np.mgrid[0:rows, 0:cols]
+        grid_r = grid_r.astype(np.float32) / rows
+        grid_c = grid_c.astype(np.float32) / cols
+        
+        print(f"Generating full-resolution RBF field ({rows}x{cols}) from {N} points...")
+        
+        for i in range(N):
+            pr, pc = src_norm[i]
+            dist_sq_norm = (grid_r - pr)**2 + (grid_c - pc)**2
+            
+            # Apply scaling to distance
+            # dist = sqrt(dist_sq_norm) * scale
+            # dist_sq = dist_sq_norm * scale^2
+            dist_sq = dist_sq_norm * (scale**2)
+            
+            if kernel == 'thin_plate':
+                # phi(r) = r^2 log(r) = dist_sq * 0.5 * log(dist_sq)
+                basis = np.where(dist_sq == 0, 0, dist_sq * 0.5 * np.log(dist_sq + 1e-20))
+            else:
+                basis = np.sqrt(dist_sq) # Linear
+                
+            field += alpha[i] * basis
+            
+        return field
 
     def correct(self, num_paths=15, method='greedy', error_threshold=0.015, max_points=25, 
                 dense_step=100, sparse_step=300, gradient_window=50,
@@ -772,10 +876,22 @@ class PathCorrectedImage(Image):
         print(f"Optimization finished: {result.message} (Iterations: {result.nit})")
         
         # 5. Apply Final Correction (Full Resolution)
-        # Use cubic interpolation for the final high-quality result
-        field = self.interpolate_correction_field(
-            all_points, optimal_factors, mask, method='cubic'
-        )
+        # Use RBF prediction for consistent high-quality result (matches optimization model)
+        # field = self.interpolate_correction_field(
+        #     all_points, optimal_factors, mask, method='cubic'
+        # )
+        
+        field = self._predict_rbf_field(all_points, optimal_factors, self.pixel_array.shape, kernel='thin_plate')
+        
+        # Apply mask to field (prevent extrapolation artifacts in background)
+        # Assuming field is multiplicative, 1.0 means no correction.
+        if mask is not None:
+             # Make sure mask matches field shape
+             if mask.shape == field.shape:
+                 field[~mask] = 1.0
+        
+        # Clip field to reasonable bounds to prevent outliers
+        field = np.clip(field, 0.1, 5.0)
         
         # Create the corrected image and force the intensity to be equal to the original image
         corrected_pixels = self.pixel_array * field
