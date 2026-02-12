@@ -3,13 +3,6 @@ CEMImage: Path-Based Artifact Correction
 
 This module provides the PathCorrectedImage class which extends the base Image
 class with path-based correction using Bezier curves and adaptive sampling.
-
-The method:
-1. Detects breast boundary
-2. Generates Bezier curves from boundary points toward the opposite edge
-3. Samples points adaptively along each path (more points for longer paths)
-4. Computes correction factors at sample points
-5. Interpolates to create 2D correction field
 """
 
 import numpy as np
@@ -20,13 +13,7 @@ except ImportError:
 
 
 class PathCorrectedImage(Image):
-    """
-    Image class with path-based artifact correction using Bezier curves.
-    
-    This approach creates an interpolation grid from paths that follow
-    the breast geometry, allowing for more flexible correction than
-    distance-based methods.
-    """
+
     def __init__(self, dicom_path=None, pixel_array=None, sigma=25, radius=50):
         super().__init__(dicom_path=dicom_path, pixel_array=pixel_array)
         self._blurred_pixel_array = None
@@ -56,7 +43,7 @@ class PathCorrectedImage(Image):
         if self.pixel_array is None:
             raise ValueError("No pixel data available.")
         
-        # Normalize for thresholding (use copy to allow non-destructive)
+        # Normalize for thresholding 
         img_normalized = self.copy().normalize().pixel_array
         
         if threshold is None:
@@ -69,19 +56,18 @@ class PathCorrectedImage(Image):
         if np.sum(mask) > 0.5 * mask.size:
             mask = img_normalized < threshold
         
-        # Morphological cleanup
         mask = binary_fill_holes(mask)
         structure = np.ones((5, 5))
         mask = binary_opening(mask, structure=structure)
         mask = binary_closing(mask, structure=structure)
         
-        # Find contours (boundary)
+        # Find contours
         contours = find_contours(mask.astype(float), 0.5)
         
         if not contours:
             return mask, np.array([])
         
-        # Take the longest contour (main breast boundary)
+        # Take the longest contour
         boundary = max(contours, key=len)
         
         return mask, boundary
@@ -93,7 +79,7 @@ class PathCorrectedImage(Image):
         Args:
             boundary_points: Nx2 array of (row, col) coordinates
             smoothing: Window size for tangent estimation
-            mask: Binary mask of the breast (used to orient normals)
+            mask: Binary mask of the breast
             
         Returns:
             Nx2 array of normal vectors
@@ -109,7 +95,7 @@ class PathCorrectedImage(Image):
             centroid = np.mean(boundary_points, axis=0)
             
         for i in range(n):
-            # Use neighbors for tangent estimation
+            # tangent estimation
             i_prev = (i - smoothing) % n
             i_next = (i + smoothing) % n
             
@@ -119,8 +105,6 @@ class PathCorrectedImage(Image):
             # Tangent vector
             tangent = p_next - p_prev
             
-            # Normal: rotate 90 degrees (perpendicular)
-            # Try [-dy, dx]
             normal = np.array([-tangent[1], tangent[0]])
             
             # Normalize
@@ -156,7 +140,7 @@ class PathCorrectedImage(Image):
         
         rows, cols = self.pixel_array.shape
         
-        # 1. Determine "Chest Wall" Side
+        # Determine "Chest Wall" Side
         centroid = scipy.ndimage.center_of_mass(mask)
         margin = 5
         edges = {
@@ -170,7 +154,7 @@ class PathCorrectedImage(Image):
         if chest_side == 'left':
             chest_wall_x = 0
             skin_points = boundary[boundary[:, 1] > margin * 2]
-            # Normal flows towards left (negative column direction)
+            # Normal flows towards left
             # But normals computed are "inward". If breast is on Right, inward is Left.
         elif chest_side == 'right':
             chest_wall_x = cols - 1
@@ -179,14 +163,13 @@ class PathCorrectedImage(Image):
             chest_wall_x = 0 if centroid[1] < cols/2 else cols-1
             skin_points = boundary
 
-        # 2. Sort Skin Points (Top-to-Bottom)
         if len(skin_points) == 0: return [], mask
         
         # Sort by row
         sort_idx = np.argsort(skin_points[:, 0])
         sorted_skin = skin_points[sort_idx]
         
-        # 3. Subsample Start Points
+        # Subsample Start Points
         trim = int(len(sorted_skin) * 0.05)
         if trim > 0:
             active_skin = sorted_skin[trim:-trim]
@@ -197,21 +180,16 @@ class PathCorrectedImage(Image):
         start_points = active_skin[indices]
         
         # Compute normals for these start points
-        # Only compute normals for the selected points to save time/complexity
-        # Use simple local tangent estimation
         normals = []
         smoothing = 10
         for idx in indices:
             # Map back to sorted_skin index
-            # Need context for tangent
-            idx_in_skin = idx # relative to active_skin? No, indices is into active_skin
+            idx_in_skin = idx
             
-            # Find neighbors in sorted_skin (which is continuous-ish)
-            # Actually, sorted_skin might jump if contour is complex, but for breast skin it's usually monotonic y
-            
+            # Find neighbors in sorted_skin 
             p_curr = active_skin[idx_in_skin]
             
-            # Use points slightly up and down in the sorted list for robust tangent of the "macro" curve
+            # Use points slightly up and down in the sorted list for robust tangent
             prev_idx = max(0, idx_in_skin - smoothing)
             next_idx = min(len(active_skin)-1, idx_in_skin + smoothing)
             
@@ -226,7 +204,6 @@ class PathCorrectedImage(Image):
                 normal /= np.linalg.norm(normal)
                 
                 # Check orientation: Should point towards chest wall x
-                # Vector from start to chest wall
                 to_wall = np.array([0, chest_wall_x - p_curr[1]])
                 if np.dot(normal, to_wall) < 0:
                     normal = -normal
@@ -235,32 +212,19 @@ class PathCorrectedImage(Image):
         
         paths = []
         for start, normal in zip(start_points, normals):
-            # Start: Skin
             p0 = start
             
-            # End: Chest wall (same row as start to ensure non-crossing macro behavior)
             p3 = np.array([start[0], chest_wall_x])
             
             dist = np.linalg.norm(p3 - p0)
             
-            # Control Point 1: Extend along normal from skin
-            # Length = fraction of distance to wall, e.g. 30%
             p1 = p0 + normal * (dist * 0.3)
             
-            # Control Point 2: Guide towards the wall, maybe horizontally aligned with P3?
-            # To ensure smooth landing at chest wall, P2 should be horizontally aligned with P3
-            # So the curve arrives perpendicular to the wall (parallel to image rows)
-            # Or just interpolate.
-            
-            # Let's align P2 with P3 to have 'horizontal' arrival at chest wall
             dir_to_wall = p3 - p0
             dir_to_wall /= (np.linalg.norm(dir_to_wall) + 1e-6)
             
             p2 = p3 - dir_to_wall * (dist * 0.3)
-            # Or better: P2 is "in front of" P3. If P3 is (r, 0), P2 is (r, 50).
-            # Vector pointing OUT from wall is -dir_to_wall basically.
             
-            # Cubic Bezier
             path = self._cubic_bezier(p0, p1, p2, p3, num_points=100)
             
             # Valid mask check
@@ -287,14 +251,14 @@ class PathCorrectedImage(Image):
         Samples points along paths.
         
         Args:
-            method: 'greedy' (iterative error minimization) or 'gradient' (original heuristic).
+            method: 'greedy' (iterative error minimization) or 'gradient' (heuristic).
             error_threshold: Max allowed interpolation error (normalized 0-1) for greedy method.
             max_points: Max points per path for greedy method.
         """
         if method == 'gradient':
             return self._sample_paths_gradient(paths, dense_step, sparse_step, gradient_window)
         else:
-            return self._sample_paths_greedy(paths, error_threshold, max_points)
+            return self._sample_paths_greedy(paths, error_threshold, max_points, block_r)
 
     def _sample_paths_greedy(self, paths, error_threshold=0.015, max_points=25, block_r=50):
         """
@@ -306,7 +270,7 @@ class PathCorrectedImage(Image):
         for path in paths:
             if len(path) < 2: continue
             
-            # 1. Extract Full Profile at 1px-ish resolution
+            # Extract Full Profile at 1px-ish resolution
             diffs = np.diff(path, axis=0)
             lengths = np.linalg.norm(diffs, axis=1)
             cumulative = np.concatenate([[0], np.cumsum(lengths)])
@@ -319,9 +283,7 @@ class PathCorrectedImage(Image):
                 
             analysis_t = np.linspace(0, total_length, num_analysis)
             
-            # Interpolate coordinates
-            # Vectorized interpolation
-            # Note: Path points are not necessarily equidistant, so we map analysis_t to path segment indices
+            # Map analysis_t to path segment indices
             analysis_indices = np.searchsorted(cumulative, analysis_t) - 1
             analysis_indices = np.clip(analysis_indices, 0, len(path) - 2)
             
@@ -334,7 +296,7 @@ class PathCorrectedImage(Image):
             coords = np.vstack((r_coords, c_coords))
             profile = scipy.ndimage.map_coordinates(self.blurred_pixel_array, coords, order=1, mode='nearest')
             
-            # Normalize Profile (0-1) for consistent thresholding
+            # Normalize Profile for consistent thresholding
             p_min, p_max = np.min(profile), np.max(profile)
             if p_max - p_min < 1e-6:
                 sampled.append(np.array([path[0], path[-1]])) # Flat profile
@@ -342,15 +304,39 @@ class PathCorrectedImage(Image):
                 
             profile_norm = (profile - p_min) / (p_max - p_min)
             
-            # 2. Iterative Selection
-            # Start with endpoints
+            # Iterative Selection
             indices = [0, num_analysis-1]
             
-            # Add max gradient point (Heuristic initialization to catch the main edge fast)
+            # Create a mask for valid sampling positions
+            valid_mask = np.ones(num_analysis, dtype=bool)
+            
+            # Helper to update mask
+            def update_mask(mask, idx, t_arr, radius):
+                center_t = t_arr[idx]
+                # Find range
+                dist = np.abs(t_arr - center_t)
+                mask[dist < radius] = False
+                return mask
+
+            # Block around endpoints
+            valid_mask = update_mask(valid_mask, 0, analysis_t, block_r)
+            valid_mask = update_mask(valid_mask, num_analysis-1, analysis_t, block_r)
+            
+            # Add max gradient point
             grad = np.abs(np.gradient(profile_norm))
             grad[0:10] = 0; grad[-10:] = 0 # Ignore boundary effects
-            peak_idx = np.argmax(grad)
-            if peak_idx not in indices: indices.append(peak_idx)
+            
+            # Apply mask to gradient search
+            masked_grad = grad.copy()
+            masked_grad[~valid_mask] = -1.0 # Suppress invalid regions
+            
+            peak_idx = np.argmax(masked_grad)
+            
+            # Only add if a valid peak (grad >= 0)
+            if masked_grad[peak_idx] >= 0:
+                if peak_idx not in indices: 
+                    indices.append(peak_idx)
+                    valid_mask = update_mask(valid_mask, peak_idx, analysis_t, block_r)
             
             indices.sort()
             
@@ -364,14 +350,21 @@ class PathCorrectedImage(Image):
                 # Compute Error
                 error = np.abs(profile_norm - interpolated)
                 
+                # Mask out invalid regions
+                error[~valid_mask] = 0.0
+                
                 # Find Max Error
                 max_err_idx = np.argmax(error)
+                
+                # Check convergence
                 if error[max_err_idx] < error_threshold:
                     break
                     
                 if max_err_idx not in indices:
                     indices.append(max_err_idx)
                     indices.sort()
+                    # Block region around new point
+                    valid_mask = update_mask(valid_mask, max_err_idx, analysis_t, block_r)
             
             # Map indices back to coordinates
             final_r = r_coords[indices]
@@ -391,7 +384,7 @@ class PathCorrectedImage(Image):
             if len(path) < 2:
                 continue
                 
-            # 1. Create a dense temporary profile for analysis
+            # Create a dense profile
             diffs = np.diff(path, axis=0)
             lengths = np.linalg.norm(diffs, axis=1)
             cumulative = np.concatenate([[0], np.cumsum(lengths)])
@@ -417,18 +410,13 @@ class PathCorrectedImage(Image):
             
             # Extract intensity profile
             coords = np.vstack((r_coords, c_coords))
-            # Interpolate the pixel values at analysis coordinates by picking the nearest pixel value to the coordinate value
+            # Interpolate the pixel values at analysis coordinates by picking the nearest pixel value to the coordinate value from the blurred array
             profile = scipy.ndimage.map_coordinates(self.blurred_pixel_array, coords, order=1, mode='nearest')
             
-            # 2. Compute Gradient Magnitude (Robust)
-            # Use heavy smoothing to find the "macro" artifact trend, ignoring local noise/lesions
-            # profile_smooth = scipy.ndimage.gaussian_filter1d(profile, sigma=5) # Increased smoothing
+            # Compute Gradient Magnitude
             gradient = np.abs(np.gradient(profile))
             
-            # 3. Find the "Event" (Tissue Thickness Change)
-            # Skip skin entrance
             skip_skin_idx = int(skip_skin_px / 5)
-            # Limit search
             search_limit_idx = int(search_limit_px / 5) 
             
             valid_gradient = gradient[skip_skin_idx:min(len(gradient), search_limit_idx)]
@@ -446,7 +434,7 @@ class PathCorrectedImage(Image):
             dense_start_dist = analysis_t[dense_start_idx]
             dense_end_dist = analysis_t[dense_end_idx]
             
-            # 4. Generate Final Sample Points
+            # Generate Final Sample Points
             target_lengths = [0.0]
             current_dist = 0.0
             
@@ -496,7 +484,8 @@ class PathCorrectedImage(Image):
         # Compute distance transform for target estimation
         distances = distance_transform_edt(mask)
         
-        # Estimate target intensity from deep interior (high distance)
+        # Estimate target intensity from deep interior
+        # NOT IN USE
         max_dist = np.max(distances)
         interior_mask = distances > 0.0 * max_dist
         target_intensity = np.median(self.blurred_pixel_array[interior_mask])
@@ -510,7 +499,7 @@ class PathCorrectedImage(Image):
                 ci = int(np.clip(c, 0, cols - 1))
                 
                 if mask[ri, ci]:
-                    # Local intensity (use small neighborhood for robustness)
+                    # Local intensity
                     r_min, r_max = max(0, ri-2), min(rows, ri+3)
                     c_min, c_max = max(0, ci-2), min(cols, ci+3)
                     local_intensity = np.median(self.blurred_pixel_array[r_min:r_max, c_min:c_max])
@@ -551,7 +540,7 @@ class PathCorrectedImage(Image):
         field = griddata(points, corrections, (grid_r, grid_c), 
                         method=method, fill_value=1.0)
         
-        # Apply mask (correction is 1.0 outside breast)
+        # Apply mask
         field[~mask] = 1.0
         
         # Handle any remaining NaNs
@@ -634,36 +623,35 @@ class PathCorrectedImage(Image):
             else:
                 return r
                 
-        # 1. Compute Kernel Matrix for Source Points (K_cc)
+        # Compute Kernel Matrix for Source Points (K_cc)
         # Add regularization to diagonal for stability
-        # Scale distances!
+        # Scale distances
         d_cc = cdist(src_norm, src_norm) * scale
         K_cc = rbf_kernel(d_cc, method=kernel)
         np.fill_diagonal(K_cc, K_cc.diagonal() + 1e-8) # Regularization
         
-        # 2. Compute Inverse of K_cc
+        # Compute Inverse of K_cc
         # Solve for interpolation weights: K_cc * w = values -> w = K_cc_inv * values
-        # We want matrix M such that M * values = interpolated
         # Interpolated = K_tc * w = K_tc * (K_cc_inv * values) = (K_tc * K_cc_inv) * values
         # So M = K_tc @ K_cc_inv
         try:
             K_cc_inv = np.linalg.inv(K_cc)
         except np.linalg.LinAlgError:
-            # Fallback for singular matrix (e.g. duplicate points)
+            # Fallback for singular matrix
             K_cc_inv = np.linalg.pinv(K_cc)
             
-        # 3. Compute Kernel Matrix for Target Points (K_tc)
+        # Compute Kernel Matrix for Target Points (K_tc)
         d_tc = cdist(tgt_norm, src_norm) * scale
         K_tc = rbf_kernel(d_tc, method=kernel)
         
-        # 4. Compute Final Matrix M
+        # Compute Final Matrix M
         M = K_tc @ K_cc_inv
         
         return M
 
     def _predict_rbf_field(self, source_points, values, target_shape, kernel='thin_plate'):
         """
-        Generates full-resolution field using RBF interpolation (memory efficient).
+        Generates full-resolution field using RBF interpolation.
         Field(x) = sum( w_i * phi(|x - c_i|) )
         Coordinates are normalized to [0, 1] for numerical stability.
         
@@ -686,12 +674,11 @@ class PathCorrectedImage(Image):
         scale = np.mean(domain_shape)
         
         # Normalize source points to [0, 1] using original image shape
-        # (This assumes source_points are in pixel coordinates of the original image)
         src_norm = self._normalize_coords(source_points, domain_shape)
         
-        # 1. Solve for RBF weights (alpha)
+        # Solve for RBF weights (alpha)
         # K_cc * alpha = values  ->  alpha = K_cc_inv * values
-        # Scale distances!
+        # Scale distances
         d_cc = cdist(src_norm, src_norm) * scale
         
         if kernel == 'thin_plate':
@@ -706,10 +693,10 @@ class PathCorrectedImage(Image):
         except np.linalg.LinAlgError:
             alpha = np.linalg.lstsq(K_cc, values, rcond=None)[0]
             
-        # 2. Generate Field (Accumulate contributions)
+        # Generate Field
         field = np.zeros(target_shape, dtype=np.float32)
         
-        # We need normalized grid coordinates for the target shape
+        # normalized grid coordinates for the target shape
         # grid_r = y / rows, grid_c = x / cols
         grid_r, grid_c = np.mgrid[0:rows, 0:cols]
         grid_r = grid_r.astype(np.float32) / rows
@@ -736,7 +723,7 @@ class PathCorrectedImage(Image):
             
         return field
 
-    def correct(self, num_paths=15, method='greedy', error_threshold=0.015, max_points=25, 
+    def correct(self, num_paths=15, method='greedy', error_threshold=0.015, max_points=25, block_r=50,
                 dense_step=100, sparse_step=300, gradient_window=50,
                 interpolation='cubic', smoothing_sigma=10):
         """
@@ -746,6 +733,7 @@ class PathCorrectedImage(Image):
             num_paths: Number of Bezier curves.
             method: 'greedy' or 'gradient'.
             error_threshold, max_points: Params for greedy.
+            block_r: Minimum distance for greedy.
             dense_step, sparse_step, gradient_window: Params for gradient.
         """
         # Generate paths
@@ -757,7 +745,7 @@ class PathCorrectedImage(Image):
         
         # Sample points adaptively
         sample_points = self.sample_paths_adaptively(
-            paths, method=method, error_threshold=error_threshold, max_points=max_points,
+            paths, method=method, error_threshold=error_threshold, max_points=max_points, block_r=block_r,
             dense_step=dense_step, sparse_step=sparse_step, gradient_window=gradient_window
         )
         
@@ -783,7 +771,7 @@ class PathCorrectedImage(Image):
         
         return corrected_image, field, paths, sample_points
 
-    def correct_optimized(self, num_paths=15, method='greedy', error_threshold=0.015, max_points=25, 
+    def correct_optimized(self, num_paths=15, method='greedy', error_threshold=0.015, max_points=25, block_r=50,
                           dense_step=100, sparse_step=300, gradient_window=50,
                           regularization_weight=1.0, downsample_factor=4, field_bounds=(0.1, 5.0)):
         """
@@ -791,6 +779,7 @@ class PathCorrectedImage(Image):
         
         Args:
             num_paths, ...: Sampling parameters (see correct method)
+            block_r: Minimum distance for greedy.
             smoothing_sigma: Sigma for final field smoothing
             regularization_weight: Weight for smoothness/drift penalty
             downsample_factor: Factor to downsample image for faster optimization (default 4)
@@ -807,12 +796,11 @@ class PathCorrectedImage(Image):
             return self.correct(num_paths=num_paths) # Fallback
             
         sample_points = self.sample_paths_adaptively(
-            paths, method=method, error_threshold=error_threshold, max_points=max_points,
+            paths, method=method, error_threshold=error_threshold, max_points=max_points, block_r=block_r,
             dense_step=dense_step, sparse_step=sparse_step, gradient_window=gradient_window
         )
         
         # Initial guess: Use heuristic correction
-        # Note: compute_correction_at_points filters out points outside mask! we must use ITS output points.
         print("Computing heuristic guess...")
         all_pts_h, heuristic_factors = self.compute_correction_at_points(sample_points, mask)
         
@@ -822,7 +810,7 @@ class PathCorrectedImage(Image):
         
         initial_factors = heuristic_factors
         
-        # 2. Prepare data for optimization (Downsampled)
+        # Prepare data for optimization (Downsampled)
         if downsample_factor > 1:
             img_small = self.blurred_pixel_array[::downsample_factor, ::downsample_factor]
             mask_small = mask[::downsample_factor, ::downsample_factor]
@@ -836,7 +824,10 @@ class PathCorrectedImage(Image):
         # Pre-compute masked image pixels for fast std calculation
         valid_pixels = img_small[mask_small]
         
-        # -- PRE-COMPUTE INTERPOLATION MATRIX --
+        # Target mean intensity to conserve intensity
+        target_mean = np.mean(valid_pixels)
+        
+        # Pre-compute interpolation matrix outside the loop
         # Find coordinates of all valid pixels
         r_coords, c_coords = np.where(mask_small)
         valid_coords = np.vstack((r_coords, c_coords)).T
@@ -845,17 +836,23 @@ class PathCorrectedImage(Image):
         # Use Thin Plate Spline for smooth global interpolation
         interp_matrix = self._compute_rbf_matrix(opt_points, valid_coords, kernel='thin_plate')
         
-        # 3. Define Objective Function
+        # Define Objective Function
         def objective(factors):
-            # Fast Matrix Multiplication
             # field_values = M @ factors
             field_values = interp_matrix.dot(factors)
             
             # Apply correction
             corrected_pixels = valid_pixels * field_values
             
-            # Metric: Standard Deviation
-            std_dev = np.std(corrected_pixels)
+            # Normalize intensity to match target mean
+            current_mean = np.mean(corrected_pixels)
+            if current_mean > 1e-6:
+                corrected_norm = corrected_pixels * (target_mean / current_mean)
+            else:
+                corrected_norm = corrected_pixels # Should not happen unless field is 0
+            
+            # Metric: Standard Deviation of normalized image
+            std_dev = np.std(corrected_norm)
             
             # Regularization: Penalize deviation from 1.0 (drift)
             reg_drift = np.mean((factors - 1.0)**2)
@@ -863,7 +860,7 @@ class PathCorrectedImage(Image):
             # Total Loss
             return std_dev + regularization_weight * reg_drift
             
-        # 4. Run Optimization
+        # Run Optimization
         n_points = len(initial_factors)
         bounds = [field_bounds for _ in range(n_points)]
         
@@ -875,7 +872,7 @@ class PathCorrectedImage(Image):
         loss = result.fun
         print(f"Optimization finished: {result.message} (Iterations: {result.nit})")
         
-        # 5. Apply Final Correction (Full Resolution)
+        # Apply Final Correction (Full Resolution)
         # Use RBF prediction for consistent high-quality result (matches optimization model)
         # field = self.interpolate_correction_field(
         #     all_points, optimal_factors, mask, method='cubic'
@@ -883,14 +880,13 @@ class PathCorrectedImage(Image):
         
         field = self._predict_rbf_field(all_points, optimal_factors, self.pixel_array.shape, kernel='thin_plate')
         
-        # Apply mask to field (prevent extrapolation artifacts in background)
-        # Assuming field is multiplicative, 1.0 means no correction.
+        # Apply mask to field 
         if mask is not None:
              # Make sure mask matches field shape
              if mask.shape == field.shape:
                  field[~mask] = 1.0
         
-        # Clip field to reasonable bounds to prevent outliers
+        # Clip outliers
         field = np.clip(field, 0.1, 5.0)
         
         # Create the corrected image and force the intensity to be equal to the original image
@@ -946,7 +942,7 @@ class PathCorrectedImage(Image):
 
         # Extract args relevant for heuristic correction (subset of kwargs)
         valid_correct_args = [
-            'num_paths', 'method', 'error_threshold', 'max_points', 
+            'num_paths', 'method', 'error_threshold', 'max_points', 'block_r',
             'dense_step', 'sparse_step', 'gradient_window', 
             'interpolation', 'smoothing_sigma'
         ]
@@ -1004,7 +1000,7 @@ class PathCorrectedImage(Image):
         paths, _ = self.generate_bezier_paths(num_paths)
         
         # Extract sampling args for visualizaton
-        sampling_args = ['method', 'error_threshold', 'max_points', 'dense_step', 'sparse_step', 'gradient_window']
+        sampling_args = ['method', 'error_threshold', 'max_points', 'block_r', 'dense_step', 'sparse_step', 'gradient_window']
         samp_kwargs = {k: v for k, v in kwargs.items() if k in sampling_args}
         
         sample_points = self.sample_paths_adaptively(paths, **samp_kwargs)
@@ -1071,7 +1067,7 @@ class PathCorrectedImage(Image):
         
         scale_factor = np.sum(self.pixel_array) / sum_restored
         
-        # Enforce original boundary (fix "blooming" effect)
+        # Enforce original boundary
         final_result = restored * scale_factor * mask_float 
         
         return final_result
