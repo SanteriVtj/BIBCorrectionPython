@@ -772,7 +772,7 @@ class PathCorrectedImage(Image):
         return corrected_image, field, paths, sample_points
 
     def correct_optimized(self, num_paths=15, method='greedy', error_threshold=0.015, max_points=25, block_r=50,
-                          dense_step=100, sparse_step=300, gradient_window=50,
+                          dense_step=100, sparse_step=300, gradient_window=50, opt_method="L-BFGS-B",
                           regularization_weight=1.0, downsample_factor=4, field_bounds=(0.1, 5.0)):
         """
         Corrects image by optimizing correction factors to minimize intensity standard deviation.
@@ -788,7 +788,8 @@ class PathCorrectedImage(Image):
             tuple: (corrected_image, correction_field, paths, sample_points)
         """
         from scipy.optimize import minimize
-        from scipy.interpolate import griddata
+        from scipy.sparse.linalg import LinearOperator
+        import time
         
         # 1. Generate geometry (paths and sample points)
         paths, mask = self.generate_bezier_paths(num_paths=num_paths)
@@ -859,18 +860,93 @@ class PathCorrectedImage(Image):
             
             # Total Loss
             return std_dev + regularization_weight * reg_drift
+        
+        def precompute(corrected_pixels, current_mean, nm):
+            # Residual 
+            res  = corrected_pixels - current_mean
+            # Squared residual 
+            rms2 = np.dot(res, res) / nm
+            # Res norm
+            r = np.sqrt(rms2)
+            # loss grad
+            gr = (valid_pixels * res) / (nm * r)
+
+            # diagonal of hessian
+            H_diag = valid_pixels**2/(nm*r)+2*regularization_weight
+
+            return res, rms2, r, gr, H_diag
+
+            return 
             
+        def jac(factors):
+            nm = valid_pixels.size
+
+            # Compute interpolation and correction 
+            field_values = interp_matrix.dot(factors)
+            corrected_pixels = valid_pixels * field_values
+
+            current_mean = np.mean(corrected_pixels)
+
+            _, _, _, gr, _ = precompute(corrected_pixels, current_mean, nm)
+
+            reg = 2*regularization_weight*(factors-1)
+            
+            return gr + reg 
+
+        def Hop(factors):
+            nm = valid_pixels.size
+            field_values = interp_matrix.dot(factors)
+            corrected_pixels = valid_pixels * field_values
+
+            current_mean = np.mean(corrected_pixels)
+
+            _, _, r, gr, H_diag = precompute(corrected_pixels, current_mean, nm)
+            r2 = r**2
+
+            def _mv(v):
+                return H_diag * v-(np.dot(gr,v))/r2*gr
+            
+            return LinearOperator(shape=(nm, nm), matvec=_mv, dtype=np.float64)
+            
+
         # Run Optimization
         n_points = len(initial_factors)
         bounds = [field_bounds for _ in range(n_points)]
         
         print(f"Optimizing {n_points} variables on {len(valid_pixels)} pixels...")
-        result = minimize(objective, initial_factors, bounds=bounds, method='L-BFGS-B', 
-                          options={'maxiter': 100, 'ftol': 1e-4})
+        opt_start = time.time()
+        if opt_method == "L-BFGS-B":
+            result = minimize(
+                objective, 
+                initial_factors, 
+                jac=jac,
+                bounds=bounds, 
+                method='L-BFGS-B',
+                options={'maxiter': 100, 'ftol': 1e-4}
+            )
+        elif opt_method == "Newton-GC":
+            result = minimize(
+                objective,
+                initial_factors,
+                bounds = bounds,
+                method = "Newton-GC",
+                jac=jac,
+                hess=Hop,
+                options={'maxiter': 100, 'ftol': 1e-4}
+            )
+        else:
+            result = minimize(
+                objective, 
+                initial_factors,
+                bounds=bounds,
+                method='L-BFGS-B',
+                options={'maxiter': 100, 'ftol': 1e-4}
+            )
+        opt_end = time.time()
                           
         optimal_factors = result.x
         loss = result.fun
-        print(f"Optimization finished: {result.message} (Iterations: {result.nit})")
+        print(f"Optimization finished: {result.message} (Iterations: {result.nit}, Time: {(opt_end-opt_start):.3f}s, Method: {opt_method})")
         
         # Apply Final Correction (Full Resolution)
         # Use RBF prediction for consistent high-quality result (matches optimization model)
@@ -895,7 +971,7 @@ class PathCorrectedImage(Image):
         corrected_pixels = intensity*corrected_pixels
         corrected_image = PathCorrectedImage(pixel_array=corrected_pixels)
         
-        return corrected_image, field, paths, sample_points, loss
+        return corrected_image, field, paths, sample_points, loss, result
 
     def visualize_paths(self, paths=None, sample_points=None, ax=None):
         """
@@ -986,13 +1062,13 @@ class PathCorrectedImage(Image):
         # Row 1: Images
         vmin, vmax = np.percentile(self.pixel_array, (1, 99))
 
-        axes[0, 0].imshow(self.pixel_array, cmap='gray', vmin=vmin, vmax=vmax)
+        axes[0, 0].imshow(self.pixel_array, cmap='gray')
         axes[0, 0].set_title(f"Original (Std: {std_orig:.0f})")
 
-        axes[0, 1].imshow(corr_h.pixel_array, cmap='gray', vmin=vmin, vmax=vmax)
+        axes[0, 1].imshow(corr_h.pixel_array, cmap='gray')
         axes[0, 1].set_title(f"Heuristic (Red: {red_h:.1f}%)")
 
-        axes[0, 2].imshow(corr_opt.pixel_array, cmap='gray', vmin=vmin, vmax=vmax)
+        axes[0, 2].imshow(corr_opt.pixel_array, cmap='gray')
         axes[0, 2].set_title(f"Optimized (Red: {red_opt:.1f}%)")
 
         # Row 2: Fields
@@ -1025,6 +1101,7 @@ class PathCorrectedImage(Image):
         plt.tight_layout()
         if save:
             plt.savefig(figname, dpi=150)
+            return None
         else:
             return axes
         
@@ -1071,4 +1148,12 @@ class PathCorrectedImage(Image):
         final_result = restored * scale_factor * mask_float 
         
         return final_result
-
+    
+    def save_dicom(self, path):
+        # Only works for image instsances that are created out of an existing .cdm file
+        if not self.metadata == None:
+            # Take the old file and replace the pixel data with current data and save to path
+            self.metadata.PixelData = np.uint16(self.pixel_array).tobytes()
+            self.metadata.save_as(path)
+        else:
+            raise NotImplementedError()
