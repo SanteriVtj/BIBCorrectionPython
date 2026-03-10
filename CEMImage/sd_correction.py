@@ -56,123 +56,39 @@ class SDCorrectedImage(PathCorrectedImage):
         self._sd_s_end = None
         self._last_field = None
 
-    def _infer_image_edge_from_contour(self, boundary, mask_shape,
-                                    straightness_window=12,
-                                    angle_tol_deg=8.0,
-                                    dilation_px=3,
-                                    border_margin=20,
-                                    **kwargs):
+    def _build_sd_maps(
+            self,
+            d_max_percentile=97,
+            mask_to_boundary=3,
+            **kwargs
+    ):
         """
-        Detects contour segments that are actually image edges or crop lines.
+        Builds the s-d-coordinate system.
 
         Parameters
         ----------
-        boundary : (N, 2) array
-            Ordered contour in (row, col).
-        mask_shape : (H, W) tuple
-            Shape of the image.
-        straightness_window : int
-            Half-width of sliding PCA window (default 12).
-        angle_tol_deg : float
-            Angle tolerance from axes in degrees (default 8.0).
-        dilation_px : int
-            Dilation radius for edge mask (default 3).
-        border_margin : int
-            Max distance from image frame to be considered an edge (default 20).
-
-        Returns
-        -------
-        image_edge : (H, W) bool array
-            Pixel mask of inferred crop-edge region.
-        on_edge : (N,) bool array
-            Flag per contour point.
-        """
-        from scipy.ndimage import binary_dilation
-
-        H, W    = mask_shape
-        N       = len(boundary)
-        w       = straightness_window
-        tol     = np.deg2rad(angle_tol_deg)
-        on_edge = np.zeros(N, dtype=bool)
-
-        for i in range(N):
-            r, c = boundary[i]
-
-            # Check if near image border
-            dist_to_border = min(r, H - 1 - r, c, W - 1 - c)
-            if dist_to_border > border_margin:
-                continue
-
-            # Check if locally straight
-            idx  = np.arange(i - w, i + w + 1) % N
-            pts  = boundary[idx]
-            ptsc = pts - pts.mean(axis=0)
-
-            _, _, Vt  = np.linalg.svd(ptsc, full_matrices=False)
-            direction = Vt[0]
-
-            residuals = ptsc - (ptsc @ direction[:, None]) * direction
-            mse       = np.mean(np.sum(residuals ** 2, axis=1))
-            span      = np.linalg.norm(pts[-1] - pts[0]) + 1e-6
-            rel_mse   = mse / span ** 2
-
-            # Check if axis-aligned
-            angle      = np.abs(np.arctan2(direction[0], direction[1]))
-            near_horiz = angle < tol
-            near_vert  = abs(angle - np.pi / 2) < tol
-
-            if rel_mse < 0.01 and (near_horiz or near_vert):
-                on_edge[i] = True
-
-        # Project flagged points onto pixel mask and dilate
-        image_edge = np.zeros(mask_shape, dtype=bool)
-        flagged    = boundary[on_edge]
-        if len(flagged):
-            rr = np.clip(np.round(flagged[:, 0]).astype(int), 0, H - 1)
-            cc = np.clip(np.round(flagged[:, 1]).astype(int), 0, W - 1)
-            image_edge[rr, cc] = True
-            if dilation_px > 0:
-                struct     = np.ones((dilation_px * 2 + 1,) * 2, dtype=bool)
-                image_edge = binary_dilation(image_edge, structure=struct)
-
-        return image_edge, on_edge
-
-    def _build_sd_maps(self,
-                       straightness_window=12,
-                       angle_tol_deg=8.0,
-                       dilation_px=3,
-                       s_smooth_sigma=15.0,
-                       corner_radius=40,
-                       d_max_percentile=97,
-                       **kwargs):
-        """
-        Builds and caches (s, d) coordinate maps.
-
-        Finds the breast boundary, mask edges, and calculates 
-        normalized depth (d) and arc-length (s) for each pixel.
-
-        Parameters
-        ----------
-        straightness_window, angle_tol_deg, dilation_px :
-            Parameters for crop-edge detection (passed to _infer_image_edge_from_contour).
-        s_smooth_sigma : float
-            Gaussian sigma for circular smoothing of s_map (default 15.0).
-        corner_radius : int
-            Radius for blending s in crop-edge shadow zone (default 40).
         d_max_percentile : int
             Percentile used for depth normalization (default 97).
+        mask_to_boundary : int
+            Pulls the mask mask_to_boundary pixels towards the image boundaries.
+
+        Populates:
+            _sd_norm_
+            _sd_maps_params
+            _sd_s_total
+            _sd_s_origin
+            _sd_s_end
+            _sd_d_map
+            _sd_d_max
+            _sd_d_norm
+            _sd_s_norm
         """
         from scipy.ndimage import distance_transform_edt, binary_erosion, gaussian_filter
         from scipy.spatial import KDTree
         from skimage.measure import find_contours
 
-        # Cache invalidation
+        # Map caching
         current_params = {
-            'straightness_window': straightness_window,
-            'angle_tol_deg':       angle_tol_deg,
-            'dilation_px':         dilation_px,
-            's_smooth_sigma':      s_smooth_sigma,
-            'corner_radius':       corner_radius,
             'd_max_percentile':    d_max_percentile,
             **kwargs
         }
@@ -181,121 +97,49 @@ class SDCorrectedImage(PathCorrectedImage):
             return
         self._sd_maps_params = current_params
 
-        # Breast mask
+        # Create mask
         mask, _ = self.detect_boundary(threshold=kwargs.get('threshold'))
-        mask[:5,:] = np.repeat(np.any(mask[:5,:], axis=0)[np.newaxis,:], 5, axis=0)
-        mask[-5:,:] = np.repeat(np.any(mask[-5:,:], axis=0)[np.newaxis,:], 5, axis=0)
-        mask[:,:5] = np.repeat(np.any(mask[:,:5], axis=1)[:,np.newaxis], 5, axis=1)
-        mask[:,-5:] = np.repeat(np.any(mask[:,-5:], axis=1)[:,np.newaxis], 5, axis=1)
+        mask[:mask_to_boundary,:] = np.repeat(np.any(mask[:mask_to_boundary,:], axis=0)[np.newaxis,:], mask_to_boundary, axis=0)
+        mask[-mask_to_boundary:,:] = np.repeat(np.any(mask[-mask_to_boundary:,:], axis=0)[np.newaxis,:], mask_to_boundary, axis=0)
+        mask[:,:mask_to_boundary] = np.repeat(np.any(mask[:,:mask_to_boundary], axis=1)[:,np.newaxis], mask_to_boundary, axis=1)
+        mask[:,-mask_to_boundary:] = np.repeat(np.any(mask[:,-mask_to_boundary:], axis=1)[:,np.newaxis], mask_to_boundary, axis=1)
         self._sd_mask = mask
 
         # Boundary contour
-        contours = find_contours(mask.astype(float), 0.5)
+        contours = find_contours(mask.astype(float), 0.99)
         if not contours:
             raise ValueError("No breast contour found — cannot build (s,d) maps.")
         boundary = max(contours, key=len)   # (N, 2) in (row, col)
         self._sd_boundary = boundary
 
-        # Infer crop-edge segments from contour geometry
-        image_edge, on_edge = self._infer_image_edge_from_contour(
-            boundary, mask.shape,
-            straightness_window=straightness_window,
-            angle_tol_deg=angle_tol_deg,
-            dilation_px=dilation_px,
-        )
-        self._sd_on_edge = on_edge
-
-        # Shift s=0/1 discontinuity to the crop region
-        edge_indices = np.where(on_edge)[0]
-        if len(edge_indices):
-            roll_by           = int(edge_indices[0])
-            boundary          = np.roll(boundary, -roll_by, axis=0)
-            on_edge           = np.roll(on_edge,  -roll_by, axis=0)
-            self._sd_boundary = boundary
-            self._sd_on_edge  = on_edge
-
-        # Remove boundary pixels right on the image border to avoid EDT artifacts
-        boundary_ring = mask & ~binary_erosion(mask)
-        H_m, W_m        = mask.shape
-        frame_strip      = np.zeros((H_m, W_m), dtype=bool)
-        frame_strip[ 0, :] = True;  frame_strip[-1, :] = True
-        frame_strip[:,  0] = True;  frame_strip[:, -1] = True
-        skin_ring          = boundary_ring & ~image_edge & ~frame_strip
-
-        self._sd_skin_ring = skin_ring
-        self._sd_edge_ring = boundary_ring & (image_edge | frame_strip)
-
-        if not skin_ring.any():
-            raise ValueError(
-                "Skin ring is empty after removing inferred crop-edge pixels. "
-                "Try reducing straightness_window or angle_tol_deg."
-            )
+        # Set 0 and 1 coordinates for s
+        s0 = boundary[-1,:]; s1 = boundary[0,:]
 
         # Scale arc-lengths to [0, 1] across the skin-wall span
-        skin_contour     = boundary[~on_edge]
-        seg_lengths      = np.linalg.norm(np.diff(boundary, axis=0), axis=1)
-        arc_lengths_all  = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-        skin_arc_lengths = arc_lengths_all[~on_edge]
+        seg_lengths = np.linalg.norm(np.diff(boundary, axis=0), axis=1)
+        arc_lengths = np.concatenate([[0.0], np.cumsum(seg_lengths)])
 
-        if len(skin_contour) < 2:
-            raise ValueError("Insufficient skin-wall points found.")
+        skin_start = float(arc_lengths[0])
+        skin_span = float(arc_lengths[-1] - arc_lengths[0])
+        skin_arc_lengths = arc_lengths - skin_start
 
-        skin_start        = float(skin_arc_lengths[0])
-        skin_span         = float(skin_arc_lengths[-1] - skin_arc_lengths[0])
-        skin_arc_lengths  = skin_arc_lengths - skin_start
+        self._sd_s_total = skin_arc_lengths[-1].astype(float)
+        self._sd_s_origin = s0   # image-frame point, s = 0
+        self._sd_s_end = s1   # image-frame point, s = total_span
 
-        # Extend arc-lengths to image borders for robust parameterisation
-        H_img, W_img = mask.shape
+        boundary_mask = np.full(mask.shape, False)
+        br = boundary.astype(int)[:,0]; bc = boundary.astype(int)[:,1]
+        boundary_mask[br,bc] = True
 
-        def _snap_to_border(pt):
-            """Project a point onto the nearest side of the image frame."""
-            r, c  = float(pt[0]), float(pt[1])
-            dists = [r, H_img - 1.0 - r, c, W_img - 1.0 - c]
-            i_min = int(np.argmin(dists))
-            if i_min == 0:   return np.array([0.0,              c])
-            elif i_min == 1: return np.array([float(H_img - 1), c])
-            elif i_min == 2: return np.array([r,                0.0])
-            else:            return np.array([r,                float(W_img - 1)])
-
-        n_edge = int(on_edge.sum())
-        if n_edge > 0:
-            # After rolling, boundary[0 .. n_edge-1] are the crop-edge points:
-            #   boundary[n_edge-1] is the last edge point, adjacent to
-            #                       skin_contour[0]  → this becomes the s=0 end.
-            #   boundary[0]        is the first edge point, adjacent to
-            #                       skin_contour[-1] → this becomes the s=max end.
-            snapped_top = _snap_to_border(boundary[n_edge - 1])  # s = 0 end
-            snapped_bot = _snap_to_border(boundary[0])           # s = max end
-
-            # Extra arc-length from each snapped point to the skin transition
-            extra_start = float(np.linalg.norm(snapped_top - skin_contour[0]))
-            extra_end   = float(np.linalg.norm(snapped_bot  - skin_contour[-1]))
-
-            # Shift skin arc-lengths so that s=0 lies at snapped_top
-            skin_arc_lengths = skin_arc_lengths + extra_start
-            total_span       = extra_start + skin_span + extra_end
-        else:
-            # No crop edge detected – fall back to original skin-corner anchors
-            snapped_top = skin_contour[0].astype(float)
-            snapped_bot = skin_contour[-1].astype(float)
-            total_span  = skin_span
-
-        self._sd_s_total   = total_span
-        self._sd_s_origin  = snapped_top   # image-frame point, s = 0
-        self._sd_s_end     = snapped_bot   # image-frame point, s = total_span
-
-        # Compute depth (d) map using EDT on skin pixels only
-        d_map_full, nearest_idx = distance_transform_edt(
-            ~skin_ring, return_indices=True
-        )
+        # Compute d-coordinates
+        d_map_full, nearest_idx = distance_transform_edt(~boundary_mask, return_indices=True)
         self._sd_d_map = np.where(mask, d_map_full, 0.0)
-        self._sd_d_max = float(
-            np.percentile(self._sd_d_map[mask], d_max_percentile)
-        )
+        self._sd_d_max = float(np.percentile(self._sd_d_map[mask], d_max_percentile))
+        
 
         # Assign arc-lengths to every skin-ring pixel
-        ctree = KDTree(skin_contour)
-        rr, cc = np.where(skin_ring)
+        ctree = scipy.spatial.KDTree(boundary)
+        rr, cc = np.where(boundary_mask)
         _, nn  = ctree.query(np.column_stack([rr, cc]))
         arc_length_map = np.zeros(mask.shape, dtype=np.float64)
         arc_length_map[rr, cc] = skin_arc_lengths[nn]
@@ -307,44 +151,8 @@ class SDCorrectedImage(PathCorrectedImage):
             0.0
         )
 
-        # Blend s in corner shadow zones for smooth transitions
-        corner_top = snapped_top   # image-frame endpoint, s = 0
-        corner_bot = snapped_bot   # image-frame endpoint, s = total_span
-
-        int_r, int_c = np.where(mask)
-        pts_int      = np.column_stack([int_r, int_c]).astype(np.float64)
-
-        # Identify shadow-zone pixels: those whose nearest skin pixel sits
-        # within corner_radius of either skin-edge transition corner.
-        nearest_skin_pts = np.column_stack([
-            nearest_idx[0][int_r, int_c],
-            nearest_idx[1][int_r, int_c]
-        ]).astype(np.float64)
-        dist_near_top = np.linalg.norm(nearest_skin_pts - skin_contour[0], axis=1)
-        dist_near_bot = np.linalg.norm(nearest_skin_pts - skin_contour[-1], axis=1)
-        in_shadow = (dist_near_top < corner_radius) | \
-                    (dist_near_bot < corner_radius)
-
-        # Blend s by projecting each pixel onto the corner_top → corner_bot
-        # axis.  t=0 at corner_top (s=0), t=1 at corner_bot (s=total_span).
-        crop_vec = (corner_bot - corner_top).astype(np.float64)
-        crop_len = float(np.linalg.norm(crop_vec))
-        crop_dir = crop_vec / (crop_len + 1e-12)
-
-        # Scalar projection of each pixel onto the crop-edge axis
-        proj = np.dot(pts_int - corner_top, crop_dir)
-        t    = np.clip(proj / (crop_len + 1e-12), 0.0, 1.0)
-
-        s_blend = t * total_span   # s=0 at corner_top, s=total_span at corner_bot
-
-        s_map_fixed = s_map_raw.copy()
-        shadow_mask = np.zeros(mask.shape, dtype=bool)
-        shadow_mask[int_r[in_shadow], int_c[in_shadow]] = True
-        s_map_fixed[shadow_mask] = s_blend[in_shadow]
-
-        self._sd_s_map       = s_map_fixed
-        self._sd_shadow_mask = shadow_mask
-
+        self._sd_s_map = s_map_raw
+        
         # Normalised depth
         self._sd_d_norm = np.clip(self._sd_d_map / self._sd_d_max, 0.0, 1.0)
 
@@ -692,46 +500,64 @@ class SDCorrectedImage(PathCorrectedImage):
 
         return M_free_bc, free_idx_bc, merge_map, keep
 
-    def _reg_and_grad(self, q, free_idx, ns, nd, lam_smooth, lam_drift, alpha=1.0):
+    def _reg_and_grad(self, q, free_idx, ns, nd, lam_smooth, lam_drift):
         """
         Computes the regularization loss and its gradient for spline grid parameters.
 
-        Combines smoothness (Laplacian) and drift (distance from 1.0) terms.
+        Both smoothness and drift are now computed in q-space (log-space):
+        - Smoothness: penalizes differences in log(p) between adjacent knots,
+                        i.e. multiplicative ratios p_ij / p_i'j'.
+        - Drift:      penalizes q away from 0, equivalent to a log-normal prior
+                        on p centered at 1 (neutral correction).
+
+        Both terms have constant Hessians in q-space ((2λ_s/K)·L and (2λ_d/K_f)·I),
+        fully consistent with the log reparametrization. The alpha parameter is kept
+        in the signature for compatibility but is not used.
         """
-        fp      = np.exp(q)
-        n_par   = ns * nd
-        n_free  = len(free_idx)
-        fp_norm = alpha * fp
+        n_par  = ns * nd
+        n_free = len(free_idx)
 
-        fp_full           = np.ones(n_par, dtype=np.float64)
-        fp_full[free_idx] = fp_norm
-        g2d = fp_full.reshape(ns, nd)
+        # Reconstruct full q grid (fixed knots sit at q=0, i.e. p=1)
+        q_full = np.zeros(n_par, dtype=np.float64)
+        q_full[free_idx] = q
+        q2d = q_full.reshape(ns, nd)
 
-        ds_ = np.diff(g2d, axis=0)
-        dd_ = np.diff(g2d, axis=1)
+        # ── Smoothness in q-space: R_smooth = (λ_s/K) · q^T L q ─────────────────
+        # Hessian: (2λ_s/K) · L  [constant, PSD]
+        ds_ = np.diff(q2d, axis=0)
+        dd_ = np.diff(q2d, axis=1)
         smooth_loss = lam_smooth * (np.sum(ds_**2) + np.sum(dd_**2)) / n_par
 
-        # Gradient: ∂R_smooth/∂g[k] using discrete Laplacian stencil
-        dg = np.zeros((ns, nd), dtype=np.float64)
-        dg[1:,  :] += 2 * ds_;  dg[:-1, :] -= 2 * ds_
-        dg[:,  1:] += 2 * dd_;  dg[:,  :-1] -= 2 * dd_
-        g_smooth_p = dg.ravel()[free_idx] * lam_smooth / n_par * alpha
+        dq = np.zeros((ns, nd), dtype=np.float64)
+        dq[1:,  :] += 2 * ds_;  dq[:-1, :] -= 2 * ds_
+        dq[:,  1:] += 2 * dd_;  dq[:,  :-1] -= 2 * dd_
+        g_smooth_q = dq.ravel()[free_idx] * lam_smooth / n_par
 
-        drift_loss = lam_drift * np.mean((fp_norm - 1.0)**2)
-        g_drift_p  = 2.0 * lam_drift * (fp_norm - 1.0) / n_free * alpha
+        # ── Drift in q-space: R_drift = (λ_d/K_f) · ||q||^2 ─────────────────────
+        # Hessian: (2λ_d/K_f) · I  [constant, PD]
+        drift_loss = lam_drift * np.mean(q**2)
+        g_drift_q  = 2.0 * lam_drift * q / n_free
 
-        grad_q = (g_smooth_p + g_drift_p) * fp   # chain rule ∂/∂q = ∂/∂p · exp(q)
+        grad_q = g_smooth_q + g_drift_q
         return float(smooth_loss + drift_loss), grad_q
-    
+
+
     def _hessp_std(self, q, vec, M_free, fixed_contrib, v_opt,
-               free_idx, ns, nd, lam_smooth, lam_drift):
+                free_idx, ns, nd, lam_smooth, lam_drift):
         """
         Hessian-vector product for Trust-Region Newton-CG.
+
+        Data term:         computed in p-space (Gauss-Newton), converted to q-space
+                        via the standard chain rule H^q = p ⊙ (H^p (p ⊙ v)) + ∇_p·p·v.
+        Smoothness term:   H^q_smooth = (2λ_s/K)·L, constant in q-space, applied
+                        directly without chain-rule conversion.
+        Drift term:        H^q_drift  = (2λ_d/K_f)·I, constant in q-space, applied
+                        directly without chain-rule conversion.
         """
-        fp      = np.exp(q)
-        fv      = M_free @ fp + fixed_contrib
-        n_par   = ns * nd
-        n_free  = len(free_idx)
+        fp    = np.exp(q)
+        fv    = M_free @ fp + fixed_contrib
+        n_par = ns * nd
+        n_free = len(free_idx)
 
         mu_v    = v_opt.mean()
         mu_vf   = (v_opt * fv).mean()
@@ -742,57 +568,46 @@ class SDCorrectedImage(PathCorrectedImage):
         N       = len(u)
         sigma   = np.std(u) + 1e-12
 
-        g_data  = v_opt * (u - mu_u) / (N * sigma)
-
-        # Gradient of data term w.r.t. p (for the diagonal correction)
+        g_data      = v_opt * (u - mu_u) / (N * sigma)
         grad_data_p = alpha * (
             M_free.T @ g_data
             - (np.dot(fv_norm, g_data) / (N * mu_v)) * (M_free.T @ v_opt)
         )
 
-        # Gradient of regulariser w.r.t. p  (grad_q = grad_p · p, so grad_p = grad_q/p)
-        _, grad_reg_q = self._reg_and_grad(q, free_idx, ns, nd, lam_smooth, lam_drift, alpha=alpha)
-        grad_reg_p    = grad_reg_q / fp
-        grad_p_total  = grad_data_p + grad_reg_p
-
-        # ── p-space direction: diag(p) @ vec ─────────────────────────────────
+        # p-space direction: p ⊙ vec
         p_vec = fp * vec
 
-        # ── Data Hessian-vector product (Gauss-Newton) ────────────────────────
+        # Data Hessian-vector product (Gauss-Newton, p-space)
         Mv     = M_free @ p_vec
         term1  = (alpha**2 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
         term2  = -(alpha**2 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
         term3  = -(alpha**2 / (N * sigma**2)) * (M_free.T @ (v_opt * (u - mu_u))) * (g_data @ Mv)
         H_data_p_pvec = term1 + term2 + term3
 
-        # ── Smooth Hessian-vector product ─────────────────────────────────────
-        # H_smooth_p @ p_vec = α² · lam/n · L @ p_vec_full[free_idx]
-        # Discrete 2-D Laplacian applied via the same stencil as _reg_and_grad.
+        # Convert data term to q-space via chain rule:
+        #   H^q z = p ⊙ (H^p (p ⊙ z)) + ∇_p L ⊙ p ⊙ z
+        H_data_q = fp * H_data_p_pvec + grad_data_p * fp * vec
+
+        # Smooth Hessian-vector product (H^q_smooth = (2λ_s/K)·L, constant)
+        # Apply discrete 2-D Laplacian directly to vec (already in q-space).
         v_full = np.zeros(n_par, dtype=np.float64)
-        v_full[free_idx] = alpha * p_vec        # effective field direction
+        v_full[free_idx] = vec
         v_grid = v_full.reshape(ns, nd)
         dvs = np.diff(v_grid, axis=0)
         dvd = np.diff(v_grid, axis=1)
         dv  = np.zeros((ns, nd), dtype=np.float64)
         dv[1:,  :] += 2 * dvs;  dv[:-1, :] -= 2 * dvs
         dv[:,  1:] += 2 * dvd;  dv[:,  :-1] -= 2 * dvd
-        H_smooth_p_pvec = dv.ravel()[free_idx] * lam_smooth / n_par * alpha
+        H_smooth_q = dv.ravel()[free_idx] * lam_smooth / n_par
 
-        # ── Drift Hessian-vector product ──────────────────────────────────────
-        H_drift_p_pvec = 2.0 * lam_drift * alpha**2 / n_free * p_vec
+        # Drift Hessian-vector product (H^q_drift = (2λ_d/K_f)·I, constant)
+        H_drift_q = 2.0 * lam_drift / n_free * vec
 
-        H_reg_p_pvec = H_smooth_p_pvec + H_drift_p_pvec
-
-        # ── Convert to q-space ────────────────────────────────────────────────
-        # H_q @ vec = p ⊙ (H_p @ (p ⊙ vec)) + grad_p ⊙ p ⊙ vec
-        H_data_q = fp * H_data_p_pvec + grad_data_p * fp * vec
-        H_reg_q  = fp * H_reg_p_pvec  + grad_reg_p  * fp * vec
-
-        return (H_data_q + H_reg_q).astype(np.float64)
+        return (H_data_q + H_smooth_q + H_drift_q).astype(np.float64)
 
 
     def _objective_std(self, q, M_free, fixed_contrib, v_opt,
-                       free_idx, ns, nd, lam_smooth, lam_drift):
+                    free_idx, ns, nd, lam_smooth, lam_drift):
         """
         Standard deviation objective function for L-BFGS optimization.
         """
@@ -817,7 +632,7 @@ class SDCorrectedImage(PathCorrectedImage):
         grad_data_q = grad_data_p * fp
 
         reg_loss, g_reg_q = self._reg_and_grad(
-            q, free_idx, ns, nd, lam_smooth, lam_drift, alpha=alpha
+            q, free_idx, ns, nd, lam_smooth, lam_drift
         )
         return float(sigma) + reg_loss, (grad_data_q + g_reg_q).astype(np.float64)
 
