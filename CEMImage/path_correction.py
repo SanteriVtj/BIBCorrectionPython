@@ -44,17 +44,13 @@ class PathCorrectedImage(Image):
             raise ValueError("No pixel data available.")
         
         # Normalize for thresholding 
-        img_normalized = self.copy().normalize().pixel_array
+        img_normalized = self.copy().normalize().invert().pixel_array
         
         if threshold is None:
             threshold = threshold_otsu(img_normalized)
         
         # Create binary mask
         mask = img_normalized > threshold
-        
-        # Auto-detect inversion
-        if np.sum(mask) > 0.5 * mask.size:
-            mask = img_normalized < threshold
         
         mask = binary_fill_holes(mask)
         structure = np.ones((5, 5))
