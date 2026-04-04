@@ -2,6 +2,8 @@
 /Raw
 /Suppressed
 /Non-suppressed
+/Suppressed2
+/Non-suppressed2
 *.png
 *.ipynb
 *.pdf
