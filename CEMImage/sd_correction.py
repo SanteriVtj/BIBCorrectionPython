@@ -155,7 +155,7 @@ class SDCorrectedImage(PathCorrectedImage):
         
         # Normalised depth
         self._sd_d_norm = np.clip(self._sd_d_map / self._sd_d_max, 0.0, 1.0)
-
+        # Normalized arc-length
         self._sd_s_norm = np.where(mask, self._sd_s_map / self._sd_s_total, 0.)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -272,7 +272,7 @@ class SDCorrectedImage(PathCorrectedImage):
                         sc[i] = sc[i - 1] + eps
                 sc[-1] = s_hi  # restore the hard upper bound
 
-            # d-knots: placement by strategy
+            # d-knots
             d_lo = float(np.percentile(d_flat, 100.0 * d_margin))
             d_hi = float(np.percentile(d_flat, 100.0 * (1.0 - d_margin)))
 
@@ -338,29 +338,29 @@ class SDCorrectedImage(PathCorrectedImage):
                 )
 
             # Prevent knot overlap near the medial axis
-            shell_half = 0.5 / n_d_probe
-            d_probe    = np.linspace(d_lo, d_hi, n_d_probe)
+            # shell_half = 0.5 / n_d_probe
+            # d_probe    = np.linspace(d_lo, d_hi, n_d_probe)
 
-            # Assign every masked pixel to its nearest s-column
-            col_assign = np.argmin(
-                np.abs(s_flat[:, None] - sc[None, :]), axis=1
-            )
+            # # Assign every masked pixel to its nearest s-column
+            # col_assign = np.argmin(
+            #     np.abs(s_flat[:, None] - sc[None, :]), axis=1
+            # )
 
-            safe_d_hi = d_hi
-            for d_level in reversed(d_probe):
-                in_shell = (
-                    (d_flat >= d_level - shell_half) &
-                    (d_flat <= d_level + shell_half)
-                )
-                all_ok = all(
-                    int(np.sum(in_shell & (col_assign == i))) >= min_strip_pixels
-                    for i in range(ns)
-                )
-                if all_ok:
-                    safe_d_hi = float(d_level)
-                    break
+            # safe_d_hi = d_hi
+            # for d_level in reversed(d_probe):
+            #     in_shell = (
+            #         (d_flat >= d_level - shell_half) &
+            #         (d_flat <= d_level + shell_half)
+            #     )
+            #     all_ok = all(
+            #         int(np.sum(in_shell & (col_assign == i))) >= min_strip_pixels
+            #         for i in range(ns)
+            #     )
+            #     if all_ok:
+            #         safe_d_hi = float(d_level)
+            #         break
 
-            d_hi = min(d_hi, safe_d_hi)
+            # d_hi = min(d_hi, safe_d_hi)
 
             # Enforce strict monotonicity
             # dc[0]  = d_lo;  dc[-1]  = d_hi
@@ -433,74 +433,314 @@ class SDCorrectedImage(PathCorrectedImage):
 
         return knot_xy
 
-    def _apply_medial_boundary_conditions(self, knot_xy, dc, M_free, free_idx,
-                                          n_par, ns, nd,
-                                          d_bc_thresh, bc_radius_px):
+    def _apply_medial_boundary_conditions(
+            self, knot_xy, dc, M_free, free_idx,
+            n_pars, ns, nd, d_bc_thresh, bc_radius_px):
         """
-        Forces coincident deep knots to share the same value (merged).
+        Forces coincident deep knots to share the same value.
 
-        This ensures smooth transitions in deep tissue where coordinate shells 
-        might otherwise overlap.
+        Builds a weighted graph over all free knots whose depth coordinate
+        exceeds d_bc_thresh.  Each node is a knot, each edge carries the
+        Euclidean pixel-space distance between the two endpoints.  Connected
+        components are found by running BFS on the subgraph that contains
+        only edges with weight <= bc_radius_px.  Every knot in a component
+        is merged into a single representative.
+
+        Parameters
+        ----------
+        knot_xy     : (ns, nd, 2) array — pixel-space (row, col) of every knot
+        dc          : (nd,) array    — normalised depth of each depth column
+        M_free      : (n_pix, n_free) — B-spline interpolation matrix
+        free_idx    : (n_free,) int  — flat index i*nd+j for each column of M_free
+        n_par       : int            — ns * nd
+        ns, nd      : int            — grid dimensions
+        d_bc_thresh : float          — minimum depth to consider for merging
+        bc_radius_px: float          — merge threshold in pixels
 
         Returns
         -------
-        M_free_bc   : reduced interpolation matrix (n_pix, n_free_bc)
-        free_idx_bc : reduced free-parameter index array (n_free_bc,)
-        merge_map   : dict {follower_flat_idx: leader_flat_idx}
-                      After optimization: opt_par[follower] = opt_par[leader]
+        M_free_bc   : (n_pix, n_free_bc) — reduced interpolation matrix
+        free_idx_bc : (n_free_bc,) int   — flat indices of the surviving knots
+        merge_map   : dict {follower_flat: leader_flat}
+        keep        : (n_free,) bool     — True for surviving columns
         """
+        import numpy as np
+        from collections import deque
+
         M_work    = M_free.copy()
         flat_to_k = {int(f): k for k, f in enumerate(free_idx)}
         merge_map = {}
         remove_k  = set()
 
+        nodes = []
         for j in range(nd):
             if float(dc[j]) < d_bc_thresh:
                 continue
-
-            knots_j = []
             for i in range(ns):
                 flat = int(i * nd + j)
                 if flat in flat_to_k:
-                    knots_j.append((flat, knot_xy[i, j]))
+                    nodes.append((flat, flat_to_k[flat], knot_xy[i, j]))
 
-            if len(knots_j) < 2:
+        if len(nodes) < 2:
+            keep = np.ones(len(free_idx), dtype=bool)
+            print(f"  Medial BC: fewer than 2 candidate knots at "
+                f"d >= {d_bc_thresh:.2f} — nothing to merge.", flush=True)
+            return M_free, free_idx, merge_map, keep
+
+        n_nodes   = len(nodes)
+        positions = np.array([pos for _, _, pos in nodes])   # (n_nodes, 2)
+
+        # Build the weighted distance matrix
+        delta      = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+        dist_matrix = np.linalg.norm(delta, axis=-1)          # (n_nodes, n_nodes)
+
+        # Build adjacency list
+        adjacency = [[] for _ in range(n_nodes)]
+        for a in range(n_nodes):
+            for b in range(a + 1, n_nodes):
+                if dist_matrix[a, b] <= bc_radius_px:
+                    adjacency[a].append(b)
+                    adjacency[b].append(a)
+
+        # BFS to find connected components
+        visited    = [False] * n_nodes
+        components = []
+
+        for start in range(n_nodes):
+            if visited[start]:
+                continue
+            component = []
+            queue = deque([start])
+            visited[start] = True
+            while queue:
+                node = queue.popleft()
+                component.append(node)
+                for neighbour in adjacency[node]:
+                    if not visited[neighbour]:
+                        visited[neighbour] = True
+                        queue.append(neighbour)
+            components.append(component)
+
+        # Merge each multi-node component
+        for component in components:
+            if len(component) < 2:
                 continue
 
-            claimed = [False] * len(knots_j)
-            for a in range(len(knots_j)):
-                if claimed[a]:
-                    continue
-                flat_a, pos_a = knots_j[a]
-                k_a = flat_to_k[flat_a]
-                for b in range(a + 1, len(knots_j)):
-                    if claimed[b]:
-                        continue
-                    flat_b, pos_b = knots_j[b]
-                    if np.linalg.norm(pos_a - pos_b) <= bc_radius_px:
-                        k_b = flat_to_k[flat_b]
-                        M_work[:, k_a] += M_work[:, k_b]
-                        merge_map[flat_b] = flat_a
-                        remove_k.add(k_b)
-                        claimed[b] = True
+            flat_a, k_a, _ = nodes[component[0]]          # leader
 
+            for local_idx in component[1:]:                # followers
+                flat_b, k_b, _ = nodes[local_idx]
+                M_work[:, k_a] += M_work[:, k_b]          # absorb follower column
+                merge_map[flat_b] = flat_a
+                remove_k.add(k_b)
+
+        # Build the reduced matrix and index array
         keep = np.ones(len(free_idx), dtype=bool)
         for k in remove_k:
             keep[k] = False
+
         M_free_bc   = M_work[:, keep]
         free_idx_bc = free_idx[keep]
 
         n_merged = int(keep.size - keep.sum())
+        n_groups  = sum(1 for c in components if len(c) > 1)
         if n_merged:
-            print(f"  Medial BC: merged {n_merged} follower knot(s) → "
-                  f"{len(free_idx_bc)} free params (was {len(free_idx)})", flush=True)
+            print(f"  Medial BC: merged {n_merged} follower knot(s) across "
+                f"{n_groups} component(s) → "
+                f"{len(free_idx_bc)} free params (was {len(free_idx)})", flush=True)
         else:
             print(f"  Medial BC: no knots within {bc_radius_px:.0f}px at "
-                  f"d >= {d_bc_thresh:.2f} — try increasing bc_radius_px.", flush=True)
+                f"d >= {d_bc_thresh:.2f} — try increasing bc_radius_px.", flush=True)
+
+        return M_free_bc, free_idx_bc, merge_map, keep
+    
+    def _apply_seam_boundary_conditions(
+            self, knot_xy, dc, M_free, free_idx,
+            n_par, ns, nd,
+            seam_radius_px,
+            seam_s_threshold=0.05):
+        """
+        Merges knots that are physically close to the s-coordinate seam.
+
+        The s-map is built from an open skin contour whose two endpoints
+        (s=0 and s=1) both sit at the chest-wall attachment.  Inside the
+        breast the nearest-contour-point propagation creates a Voronoi seam:
+        a connected band of pixels where s_norm jumps discontinuously from
+        ~1 to ~0.  Any knot whose pixel-space position is within
+        seam_radius_px of this seam band is a candidate for merging,
+        regardless of which s-strip (i index) it belongs to.
+
+        The algorithm
+        -------------
+        1. Identify seam pixels: masked pixels where s_norm < seam_s_threshold
+        OR s_norm > 1 - seam_s_threshold.  These pixels lie in the thin
+        Voronoi zone adjacent to the discontinuity.
+        2. Build a KDTree over those pixels for O(log n) distance queries.
+        3. For every free knot, query its pixel-space distance to the nearest
+        seam pixel.
+        4. Group candidate knots (distance <= seam_radius_px) by depth level j.
+        5. Within each depth level run BFS on the pixel-distance proximity
+        graph (edge iff distance <= seam_radius_px) to find connected
+        components, then merge each component into a single leader — exactly
+        the same column-absorption used by the medial BC.
+
+        Parameters
+        ----------
+        knot_xy          : (ns, nd, 2) array — pixel (row, col) per knot
+        dc               : (nd,) array       — normalised depth per column
+        M_free           : (n_pix, n_free)   — B-spline interpolation matrix
+        free_idx         : (n_free,) int     — flat index i*nd+j per column
+        n_par            : int               — ns * nd
+        ns, nd           : int               — grid dimensions
+        seam_radius_px   : float             — merge threshold in pixels
+        seam_s_threshold : float             — s_norm fraction that defines
+                                            the seam zone (default 0.05,
+                                            i.e. s < 0.05 or s > 0.95)
+
+        Returns
+        -------
+        M_free_bc   : (n_pix, n_free_bc) — reduced interpolation matrix
+        free_idx_bc : (n_free_bc,) int   — flat indices of surviving knots
+        merge_map   : dict {follower_flat: leader_flat}
+        keep        : (n_free,) bool     — True for surviving columns
+        """
+        import numpy as np
+        from scipy.spatial import KDTree
+        from collections import deque
+
+        M_work    = M_free.copy()
+        flat_to_k = {int(f): k for k, f in enumerate(free_idx)}
+        merge_map = {}
+        remove_k  = set()
+
+        # ── 1. Build the seam pixel set ───────────────────────────────────────────
+        #
+        # Pixels with s_norm near 0 or 1 lie in the Voronoi zone adjacent to the
+        # discontinuity.  We restrict to the breast mask so we don't pick up the
+        # zero-padded background.
+
+        mask   = self._sd_mask
+        s_norm = self._sd_s_norm
+
+        seam_pixel_mask = mask & (
+            (s_norm < seam_s_threshold) | (s_norm > 1.0 - seam_s_threshold)
+        )
+        seam_pixels = np.argwhere(seam_pixel_mask)   # (M, 2) — (row, col)
+
+        if len(seam_pixels) == 0:
+            keep = np.ones(len(free_idx), dtype=bool)
+            print(f"  Seam BC: no seam pixels found at threshold "
+                f"{seam_s_threshold:.3f} — nothing to merge.", flush=True)
+            return M_free, free_idx, merge_map, keep
+
+        seam_tree = KDTree(seam_pixels)
+
+        # ── 2. Find knots within seam_radius_px of the seam ──────────────────────
+        #
+        # For each free knot query the tree; candidates are grouped by depth j
+        # so that only knots at the same depth level compete for merging.
+
+        candidates_by_depth = {j: [] for j in range(nd)}
+
+        for i in range(ns):
+            for j in range(nd):
+                flat = int(i * nd + j)
+                if flat not in flat_to_k:
+                    continue   # already removed by a prior BC pass
+
+                pos  = knot_xy[i, j]                      # (row, col)
+                dist_to_seam, _ = seam_tree.query(pos)
+
+                if dist_to_seam <= seam_radius_px:
+                    candidates_by_depth[j].append(
+                        (flat, flat_to_k[flat], pos)
+                    )
+
+        # ── 3. BFS within each depth level to find connected components ───────────
+        #
+        # Two candidate knots are connected if their mutual pixel distance is also
+        # <= seam_radius_px.  Every component is merged into its first member
+        # (the leader).
+
+        total_merged = 0
+        merged_depths = []
+
+        for j, nodes in candidates_by_depth.items():
+            if len(nodes) < 2:
+                continue
+
+            n_nodes   = len(nodes)
+            positions = np.array([pos for _, _, pos in nodes])
+
+            # Pairwise distances among the candidates at this depth level
+            delta = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+            dists = np.linalg.norm(delta, axis=-1)          # (n_nodes, n_nodes)
+
+            adjacency = [[] for _ in range(n_nodes)]
+            for a in range(n_nodes):
+                for b in range(a + 1, n_nodes):
+                    if dists[a, b] <= seam_radius_px:
+                        adjacency[a].append(b)
+                        adjacency[b].append(a)
+
+            visited    = [False] * n_nodes
+            components = []
+            for start in range(n_nodes):
+                if visited[start]:
+                    continue
+                component = []
+                queue = deque([start])
+                visited[start] = True
+                while queue:
+                    node = queue.popleft()
+                    component.append(node)
+                    for nb in adjacency[node]:
+                        if not visited[nb]:
+                            visited[nb] = True
+                            queue.append(nb)
+                components.append(component)
+
+            n_merged_j = 0
+            for component in components:
+                if len(component) < 2:
+                    continue
+                flat_a, k_a, _ = nodes[component[0]]       # leader
+                for local_idx in component[1:]:             # followers
+                    flat_b, k_b, _ = nodes[local_idx]
+                    M_work[:, k_a] += M_work[:, k_b]
+                    merge_map[flat_b] = flat_a
+                    remove_k.add(k_b)
+                    n_merged_j += 1
+
+            if n_merged_j:
+                merged_depths.append((j, float(dc[j]), n_merged_j))
+                total_merged += n_merged_j
+
+        # ── 4. Build the reduced matrix and index array ───────────────────────────
+
+        keep = np.ones(len(free_idx), dtype=bool)
+        for k in remove_k:
+            keep[k] = False
+
+        M_free_bc   = M_work[:, keep]
+        free_idx_bc = free_idx[keep]
+
+        if total_merged:
+            depth_str = ', '.join(
+                f'd={dc:.2f}({n}merged)' for _, dc, n in merged_depths
+            )
+            print(f"  Seam BC: merged {total_merged} knot(s) across "
+                f"{len(merged_depths)} depth level(s): {depth_str} "
+                f"→ {len(free_idx_bc)} free params (was {len(free_idx)})",
+                flush=True)
+        else:
+            print(f"  Seam BC: no knots within {seam_radius_px:.0f}px of the "
+                f"seam — try increasing seam_radius_px or seam_s_threshold.",
+                flush=True)
 
         return M_free_bc, free_idx_bc, merge_map, keep
 
-    def _reg_and_grad(self, q, free_idx, ns, nd, lam_smooth, lam_drift):
+    def _reg_and_grad(self, q, free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, debug=False):
         """
         Computes the regularization loss and its gradient for spline grid parameters.
 
@@ -524,39 +764,52 @@ class SDCorrectedImage(PathCorrectedImage):
 
         # ── Smoothness in q-space: R_smooth = (λ_s/K) · q^T L q ─────────────────
         # Hessian: (2λ_s/K) · L  [constant, PSD]
-        ds_ = np.diff(q2d, axis=0)
-        dd_ = np.diff(q2d, axis=1)
-        smooth_loss = lam_smooth * (np.sum(ds_**2) + np.sum(dd_**2)) / n_par
+        # ds_ = np.diff(q2d, axis=0)
+        # dd_ = np.diff(q2d, axis=1)
+        # smooth_loss = lam_smooth * (np.sum(ds_**2) + np.sum(dd_**2)) / n_par
+        
+        # dq = np.zeros((ns, nd), dtype=np.float64)
+        # dq[1:,  :] += 2 * ds_;  dq[:-1, :] -= 2 * ds_
+        # dq[:,  1:] += 2 * dd_;  dq[:,  :-1] -= 2 * dd_
+        # g_smooth_q = dq.ravel()[free_idx] * lam_smooth / n_par
 
-        dq = np.zeros((ns, nd), dtype=np.float64)
-        dq[1:,  :] += 2 * ds_;  dq[:-1, :] -= 2 * ds_
-        dq[:,  1:] += 2 * dd_;  dq[:,  :-1] -= 2 * dd_
-        g_smooth_q = dq.ravel()[free_idx] * lam_smooth / n_par
+        ds_ = np.diff(q2d, axis=0)   # shape (ns-1, nd) — s-direction differences
+        dd_ = np.diff(q2d, axis=1)   # shape (ns, nd-1) — d-direction differences
+
+        smooth_loss = (lam_smooth_s * np.sum(ds_**2) +
+                    lam_smooth_d * np.sum(dd_**2)) / n_par
+
+        # s-direction gradient (axis=0): scale by lam_smooth_s
+        dq_s = np.zeros((ns, nd), dtype=np.float64)
+        dq_s[1:,  :] += 2 * ds_
+        dq_s[:-1, :] -= 2 * ds_
+
+        # d-direction gradient (axis=1): scale by lam_smooth_d
+        dq_d = np.zeros((ns, nd), dtype=np.float64)
+        dq_d[:,  1:] += 2 * dd_
+        dq_d[:,  :-1] -= 2 * dd_
+
+        # Combine with their respective weights BEFORE indexing into free_idx
+        g_smooth_q = (dq_s.ravel() * lam_smooth_s +
+                    dq_d.ravel() * lam_smooth_d)[free_idx] / n_par
 
         # ── Drift in q-space: R_drift = (λ_d/K_f) · ||q||^2 ─────────────────────
         # Hessian: (2λ_d/K_f) · I  [constant, PD]
         drift_loss = lam_drift * np.mean(q**2)
         g_drift_q  = 2.0 * lam_drift * q / n_free
 
-        grad_q = g_smooth_q + g_drift_q
-        return float(smooth_loss + drift_loss), grad_q
+        if debug: return smooth_loss, drift_loss
+
+        return float(smooth_loss + drift_loss), (g_smooth_q + g_drift_q)
+
 
 
     def _hessp_std(self, q, vec, M_free, fixed_contrib, v_opt,
-                free_idx, ns, nd, lam_smooth, lam_drift):
-        """
-        Hessian-vector product for Trust-Region Newton-CG.
+                free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, mu=0.0):
 
-        Data term:         computed in p-space (Gauss-Newton), converted to q-space
-                        via the standard chain rule H^q = p ⊙ (H^p (p ⊙ v)) + ∇_p·p·v.
-        Smoothness term:   H^q_smooth = (2λ_s/K)·L, constant in q-space, applied
-                        directly without chain-rule conversion.
-        Drift term:        H^q_drift  = (2λ_d/K_f)·I, constant in q-space, applied
-                        directly without chain-rule conversion.
-        """
-        fp    = np.exp(q)
-        fv    = M_free @ fp + fixed_contrib
-        n_par = ns * nd
+        fp     = np.exp(q)
+        fv     = M_free @ fp + fixed_contrib
+        n_par  = ns * nd
         n_free = len(free_idx)
 
         mu_v    = v_opt.mean()
@@ -574,40 +827,179 @@ class SDCorrectedImage(PathCorrectedImage):
             - (np.dot(fv_norm, g_data) / (N * mu_v)) * (M_free.T @ v_opt)
         )
 
-        # p-space direction: p ⊙ vec
+        # ── p-space direction ────────────────────────────────────────────────────
         p_vec = fp * vec
 
-        # Data Hessian-vector product (Gauss-Newton, p-space)
-        Mv     = M_free @ p_vec
-        term1  = (alpha**2 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
-        term2  = -(alpha**2 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
-        term3  = -(alpha**2 / (N * sigma**2)) * (M_free.T @ (v_opt * (u - mu_u))) * (g_data @ Mv)
+        # ── Data Hessian-vector product (Gauss-Newton, p-space) ──────────────────
+        Mv    = M_free @ p_vec
+        term1 = (alpha**2 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
+        term2 = -(alpha**2 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
+        term3 = -(alpha**2 / (N * sigma**2)) * (M_free.T @ (v_opt * (u - mu_u))) * (g_data @ Mv)
         H_data_p_pvec = term1 + term2 + term3
 
-        # Convert data term to q-space via chain rule:
-        #   H^q z = p ⊙ (H^p (p ⊙ z)) + ∇_p L ⊙ p ⊙ z
+        # Convert data term to q-space: H^q z = p⊙(H^p(p⊙z)) + ∇_p L ⊙ p ⊙ z
         H_data_q = fp * H_data_p_pvec + grad_data_p * fp * vec
 
-        # Smooth Hessian-vector product (H^q_smooth = (2λ_s/K)·L, constant)
-        # Apply discrete 2-D Laplacian directly to vec (already in q-space).
-        v_full = np.zeros(n_par, dtype=np.float64)
+        # ── Asymmetric smoothness Hessian-vector product ──────────────────────────
+        # Expand vec into the full (ns, nd) grid, with fixed knots at 0.
+        v_full           = np.zeros(n_par, dtype=np.float64)
         v_full[free_idx] = vec
-        v_grid = v_full.reshape(ns, nd)
-        dvs = np.diff(v_grid, axis=0)
-        dvd = np.diff(v_grid, axis=1)
-        dv  = np.zeros((ns, nd), dtype=np.float64)
-        dv[1:,  :] += 2 * dvs;  dv[:-1, :] -= 2 * dvs
-        dv[:,  1:] += 2 * dvd;  dv[:,  :-1] -= 2 * dvd
-        H_smooth_q = dv.ravel()[free_idx] * lam_smooth / n_par
+        v_grid           = v_full.reshape(ns, nd)
 
-        # Drift Hessian-vector product (H^q_drift = (2λ_d/K_f)·I, constant)
+        # s-direction: accumulate with lam_smooth_s
+        dvs    = np.diff(v_grid, axis=0)
+        dv_s   = np.zeros((ns, nd), dtype=np.float64)
+        dv_s[1:,  :] += 2 * dvs
+        dv_s[:-1, :] -= 2 * dvs
+
+        # d-direction: accumulate with lam_smooth_d
+        dvd    = np.diff(v_grid, axis=1)
+        dv_d   = np.zeros((ns, nd), dtype=np.float64)
+        dv_d[:,  1:] += 2 * dvd
+        dv_d[:,  :-1] -= 2 * dvd
+
+        # Combine with respective weights BEFORE indexing, mirroring _reg_and_grad
+        H_smooth_q = (dv_s.ravel() * lam_smooth_s +
+                    dv_d.ravel() * lam_smooth_d)[free_idx] / n_par
+
         H_drift_q = 2.0 * lam_drift / n_free * vec
 
-        return (H_data_q + H_smooth_q + H_drift_q).astype(np.float64)
+        # μI is the LM shift; zero for Trust-NCG (default mu=0).
+        H_lm_q = mu * vec
+
+        return (H_data_q + H_smooth_q + H_drift_q + H_lm_q).astype(np.float64)
+    
+    def _lm_minimize(self, q0, obj_fn, hessp_fn_factory,
+                    max_iter, gtol,
+                    mu0=1e-3, mu_min=1e-12, mu_max=1e12):
+        """
+        Levenberg–Marquardt optimizer for the CV-loss objective.
+
+        Each outer iteration:
+        1. Solve the damped linear system (H_approx + μI)δ = −g via CG,
+            where H_approx is the Gauss-Newton Hessian plus regularization.
+        2. Compute the ratio ρ = (actual reduction) / (predicted reduction).
+        3. Accept the step and decrease μ if ρ > 0.25;
+            reject the step and increase μ otherwise.
+
+        The predicted reduction from the quadratic model is
+            m(δ) = g·δ + ½ δ·(H+μI)δ
+        which, because (H+μI)δ = −g when CG converges exactly, equals
+        −½ g·δ. With truncated CG the Hessian-vector product (H+μI)δ is
+        computed explicitly for an accurate predicted reduction.
+
+        Parameters
+        ----------
+        q0 : ndarray
+            Initial log-space parameters.
+        obj_fn : callable
+            Returns (loss, grad) in q-space.
+        hessp_fn_factory : callable
+            hessp_fn_factory(mu) → hessp(q, vec); builds the damped
+            Hessian-vector product for a given μ.
+        max_iter : int
+        gtol : float
+            Convergence tolerance on the gradient norm.
+        mu0 : float
+            Initial damping (default 1e-3; increased automatically if the
+            first step is not a descent).
+        mu_min, mu_max : float
+            Bounds on μ to prevent numerical under/overflow.
+
+        Returns
+        -------
+        result : scipy.optimize.OptimizeResult
+            .x       — optimal q
+            .fun     — final loss value
+            .jac     — final gradient
+            .nit     — number of outer iterations
+            .success — True if gtol was reached
+            .message — termination reason
+        """
+        from scipy.optimize import OptimizeResult
+        from scipy.sparse.linalg import LinearOperator, cg as sparse_cg
+
+        q  = q0.copy()
+        n  = len(q)
+        mu = mu0
+        nu = 2.0                      # damping scale factor on rejection
+
+        f, g = obj_fn(q)
+        nit  = 0
+
+        for k in range(max_iter):
+            g_norm = np.linalg.norm(g)
+            if g_norm < gtol:
+                break
+
+            # Inner CG solve: (H_approx + μI) δ = −g
+            # Tolerance follows the Eisenstat-Walker rule: tighter near the solution.
+            cg_tol     = min(0.5, np.sqrt(g_norm))
+            cg_maxiter = max(20, 2 * n)
+            hessp_mu   = hessp_fn_factory(mu)
+
+            def matvec(v):
+                return hessp_mu(q, v)
+
+            A     = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
+            delta, cg_info = sparse_cg(A, -g, rtol=cg_tol, maxiter=cg_maxiter)
+
+            # Predicted reduction from quadratic model
+            # pred = −g·δ − ½ δ·(H+μI)δ
+            # We reuse the Hessian-vector product rather than recomputing it.
+            Hd        = hessp_mu(q, delta)
+            predicted = -(g @ delta) - 0.5 * (delta @ Hd)
+
+            # Actual reduction
+            q_new        = q + delta
+            f_new, g_new = obj_fn(q_new)
+            actual       = f - f_new
+
+            nit += 1
+
+            # Step acceptance and μ update
+            if predicted <= 0.0:
+                # Quadratic model is not decreasing — GN curvature is unreliable.
+                # Increase damping without accepting the step.
+                mu  = min(mu * nu, mu_max)
+                nu *= 2.0
+                print(f"  LM iter {nit:3d}  f={f:.6g}  |g|={g_norm:.3g}"
+                    f"  ρ=N/A (bad model)  μ={mu:.3g}", flush=True)
+                continue
+
+            rho = actual / predicted
+
+            if rho > 0.0:
+                # Accept step
+                q, f, g = q_new, f_new, g_new
+                nu = 2.0                       # reset scale factor on acceptance
+                if rho > 0.75:
+                    mu = max(mu / 3.0, mu_min)  # step was very good: reduce damping
+                elif rho < 0.25:
+                    mu = min(mu * nu, mu_max)   # step was mediocre: increase damping
+                # 0.25 ≤ ρ ≤ 0.75: keep μ unchanged
+            else:
+                # Reject step: increase damping and try again
+                mu  = min(mu * nu, mu_max)
+                nu *= 2.0
+
+            print(f"  LM iter {nit:3d}  f={f:.6g}  |g|={g_norm:.3g}"
+                f"  ρ={rho:+.3f}  μ={mu:.3g}"
+                f"  {'accepted' if rho > 0 else 'REJECTED'}", flush=True)
+
+        g_norm_final = float(np.linalg.norm(g))
+        success      = g_norm_final < gtol
+        message      = ('Gradient norm below gtol.' if success
+                        else 'Maximum iterations reached.')
+
+        return OptimizeResult(
+            x=q, fun=float(f), jac=g,
+            nit=nit, success=success, message=message,
+        )
 
 
     def _objective_std(self, q, M_free, fixed_contrib, v_opt,
-                    free_idx, ns, nd, lam_smooth, lam_drift):
+                    free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift):
         """
         Standard deviation objective function for L-BFGS optimization.
         """
@@ -632,90 +1024,9 @@ class SDCorrectedImage(PathCorrectedImage):
         grad_data_q = grad_data_p * fp
 
         reg_loss, g_reg_q = self._reg_and_grad(
-            q, free_idx, ns, nd, lam_smooth, lam_drift
+            q, free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift
         )
         return float(sigma) + reg_loss, (grad_data_q + g_reg_q).astype(np.float64)
-
-
-    def _objective_entropy(self, q, M_free, fixed_contrib, v_opt, g_opt,
-                       free_idx, ns, nd, lam_smooth, lam_drift,
-                       depth_weight, n_bins, hist_smooth_sigma,
-                       adaptive_bandwidth=True):
-        """
-        Entropy-based objective (joint intensity-gradient distribution).
-
-        Parameters
-        ----------
-        hist_smooth_sigma : float
-            Minimum kernel bandwidth floor (default 1.5).
-        adaptive_bandwidth : bool
-            Use Silverman's rule to adjust bandwidth based on sample density.
-        """
-        from scipy.ndimage import gaussian_filter
-
-        fp = np.exp(q)
-        fv = M_free @ fp + fixed_contrib
-        W  = depth_weight
-
-        I_vals = v_opt * fv
-        G_vals = g_opt * fv
-
-        I_min, I_max = I_vals.min(), I_vals.max()
-        G_min, G_max = G_vals.min(), G_vals.max()
-
-        def _norm(v, vmin, vmax):
-            return np.clip((v - vmin) / (vmax - vmin + 1e-8) * (n_bins - 1), 0, n_bins - 1)
-
-        In = _norm(I_vals, I_min, I_max)
-        Gn = _norm(G_vals, G_min, G_max)
-
-        I_lo = np.floor(In).astype(int);  I_hi = np.minimum(I_lo + 1, n_bins - 1)
-        G_lo = np.floor(Gn).astype(int);  G_hi = np.minimum(G_lo + 1, n_bins - 1)
-        wi   = In - I_lo
-        wg   = Gn - G_lo
-
-        H2d = np.zeros((n_bins, n_bins), dtype=np.float64)
-        np.add.at(H2d, (I_lo, G_lo), W * (1 - wi) * (1 - wg))
-        np.add.at(H2d, (I_hi, G_lo), W * wi*(1 - wg))
-        np.add.at(H2d, (I_lo, G_hi), W * (1 - wi)*wg)
-        np.add.at(H2d, (I_hi, G_hi), W * wi*wg)
-
-        # Bandwidth selection
-        if adaptive_bandwidth:
-            sum_W  = float(W.sum())
-            sum_W2 = float((W**2).sum())
-            n_eff  = (sum_W**2) / (sum_W2 + 1e-12)
-            sigma_I = max(hist_smooth_sigma, 1.06 * float(np.std(In)) * n_eff**(-0.2))
-            sigma_G = max(hist_smooth_sigma, 1.06 * float(np.std(Gn)) * n_eff**(-0.2))
-        else:
-            sigma_I = hist_smooth_sigma
-            sigma_G = hist_smooth_sigma
-
-        # Smoothed histogram and entropy calculation
-        H2d_smooth = gaussian_filter(H2d, sigma=[sigma_I, sigma_G]) + 1e-10
-        P          = H2d_smooth / H2d_smooth.sum()
-        H_ent      = float(-np.sum(P * np.log(P)))
-
-        # Gradient back-prop through Gaussian filter
-        dH_dH2d_smooth = -(1.0 + np.log(P)) / H2d_smooth.sum()
-        dH_dH2d_raw    = gaussian_filter(dH_dH2d_smooth, sigma=[sigma_I, sigma_G])
-
-        scale_I = (n_bins - 1) / (I_max - I_min + 1e-8)
-        scale_G = (n_bins - 1) / (G_max - G_min + 1e-8)
-
-        c_lo_lo = dH_dH2d_raw[I_lo, G_lo];  c_hi_lo = dH_dH2d_raw[I_hi, G_lo]
-        c_lo_hi = dH_dH2d_raw[I_lo, G_hi];  c_hi_hi = dH_dH2d_raw[I_hi, G_hi]
-
-        dH_dI = W * scale_I * ((c_hi_lo*(1-wg) + c_hi_hi*wg) - (c_lo_lo*(1-wg) + c_lo_hi*wg))
-        dH_dG = W * scale_G * ((c_lo_hi*(1-wi) + c_hi_hi*wi) - (c_lo_lo*(1-wi) + c_hi_lo*wi))
-
-        grad_data_p = M_free.T @ (dH_dI * v_opt + dH_dG * g_opt)
-        grad_data_q = grad_data_p * fp
-
-        reg_loss, g_reg_q = self._reg_and_grad(
-            q, free_idx, ns, nd, lam_smooth, lam_drift, alpha=1.0
-        )
-        return H_ent + reg_loss, (grad_data_q + g_reg_q).astype(np.float64)
 
     def _apply_field(self, field):
         """Scale and apply the correction field to the image."""
@@ -756,6 +1067,8 @@ class SDCorrectedImage(PathCorrectedImage):
         bin_grid = self._build_heuristic_grid(sc, dc, ns, nd,
                                                 field_bounds=field_bounds,
                                                 **kwargs)
+        d_profile = bin_grid.mean(axis=0, keepdims=True)
+        bin_grid  = np.broadcast_to(d_profile, bin_grid.shape).copy()
 
         spline = RectBivariateSpline(sc, dc, bin_grid, kx=3, ky=3)
 
@@ -773,7 +1086,8 @@ class SDCorrectedImage(PathCorrectedImage):
         ns                 = 18,
         nd                 = 13,
         opt_stride         = 4,
-        lam_smooth         = 0.15,
+        lam_smooth_s       = 0.15,
+        lam_smooth_d       = 1.5,
         lam_drift          = 0.10,
         field_bounds       = (0.2, 3.0),
         max_iter           = 300,
@@ -786,38 +1100,42 @@ class SDCorrectedImage(PathCorrectedImage):
         _q0                = None,
         solver             = 'lbfgsb',
         bc_radius_px       = 0.0,
+        seam_radius_px     = 0.0,
         d_bc_thresh        = 0.90,
+        lm_mu0             = 1e-3,
+        lm_tau             = 0.0,
         **kwargs
     ):
         """
-        Fits the (s, d) correction field using L-BFGS-B or Trust-Region optimization.
+        Fits the (s, d) correction field using L-BFGS-B, Trust-NCG, or
+        Levenberg–Marquardt optimization.
 
         Parameters
         ----------
         solver : str
-            'lbfgsb' or 'trust-ncg' (latter objective='std' only).
-        bc_radius_px : float
-            Radius for merging deep knots at the medial axis (default 0.0).
-        d_bc_thresh : float
-            Normalised depth for applying boundary conditions (default 0.90).
-        hist_smooth_sigma : float
-            Gaussian smoothing sigma in histogram bins (default 1.5).
-        adaptive_bandwidth : bool
-            Use Silverman's rule to adjust bandwidth (default True).
+            'lbfgsb'     — L-BFGS-B with box constraints (any objective).
+            'trust-ncg'  — Trust-Region Newton-CG (objective='std' only).
+            'lm'         — Levenberg–Marquardt (objective='std' only).
+        lm_mu0 : float
+            Initial damping parameter μ₀ for LM (default 1e-3).
+        lm_tau : float
+            If > 0, μ₀ is set to lm_tau · ‖g(q₀)‖ at the start of LM,
+            which adapts the initial damping to the gradient scale.
+            Set to 0 to use lm_mu0 directly (default).
+
+        All other parameters are unchanged from the original method.
         """
-        # Rest of docstring parameters are implicit via **kwargs in many calls,
-        # but the core ones are handled by the caller or defaults.
         from scipy.optimize import minimize
         from scipy.interpolate import RectBivariateSpline
         from scipy.ndimage import sobel
         import time
 
-        if objective not in ('std', 'entropy'):
-            raise ValueError(f"objective must be 'std' or 'entropy', got '{objective}'.")
-        if solver not in ('lbfgsb', 'trust-ncg'):
-            raise ValueError(f"solver must be 'lbfgsb' or 'trust-ncg', got '{solver}'.")
-        if solver == 'trust-ncg' and objective != 'std':
-            raise ValueError("solver='trust-ncg' is only supported with objective='std'.")
+        if objective not in ('std'):
+            raise ValueError(f"objective must be 'std' got '{objective}'.")
+        if solver not in ('lbfgsb', 'trust-ncg', 'lm'):
+            raise ValueError(f"solver must be 'lbfgsb', 'trust-ncg', or 'lm', got '{solver}'.")
+        if solver in ('trust-ncg', 'lm') and objective != 'std':
+            raise ValueError(f"solver='{solver}' is only supported with objective='std'.")
 
         print("Building the s-d-map")
         t_build = time.time()
@@ -853,31 +1171,48 @@ class SDCorrectedImage(PathCorrectedImage):
         )
         print(f"  done in {time.time()-t0:.1f}s  ({len(free_idx)} free params)", flush=True)
 
-        self._last_sc       = sc
-        self._last_dc       = dc
+        self._last_sc = sc
+        self._last_dc = dc
 
-        # Medial-axis boundary conditions
-        merge_map = {}
+        merge_map  = {}
+        knot_xy    = self._compute_knot_positions(sc, dc, opt_r, opt_c, s_opt, d_opt)
+        self._last_knot_xy = knot_xy
+
+        # Cumulative boolean mask over the original free_idx.
+        # Each BC call returns a keep mask relative to the free_idx it received,
+        # so we compose them by indexing into the running mask.
+        keep_cumulative = np.ones(len(free_idx), dtype=bool)
+
         if bc_radius_px > 0.0:
-            knot_xy = self._compute_knot_positions(
-                sc, dc, opt_r, opt_c, s_opt, d_opt
-            )
-            self._last_knot_xy = knot_xy
-            M_free, free_idx, merge_map, bc_keep = self._apply_medial_boundary_conditions(
-                knot_xy, dc, M_free, free_idx,
-                n_par, ns, nd,
-                d_bc_thresh=d_bc_thresh,
-                bc_radius_px=bc_radius_px,
-            )
-            # If q0 was provided externally (e.g. from hierarchical upsampling),
-            # it was built against the pre-BC free_idx and must be trimmed to
-            # match the reduced post-BC free_idx, otherwise bounds length != len(q0).
-            if _q0 is not None:
-                _q0 = _q0[bc_keep]
+            M_free, free_idx, medial_merge_map, medial_keep = \
+                self._apply_medial_boundary_conditions(
+                    knot_xy, dc, M_free, free_idx,
+                    n_par, ns, nd,
+                    d_bc_thresh=d_bc_thresh,
+                    bc_radius_px=bc_radius_px,
+                )
+            # medial_keep is relative to the free_idx that entered the medial call,
+            # which still corresponds 1-to-1 with keep_cumulative's True positions.
+            keep_cumulative[keep_cumulative] = medial_keep
+            merge_map.update(medial_merge_map)
+
+        if seam_radius_px > 0.0:
+            M_free, free_idx, seam_merge_map, seam_keep = \
+                self._apply_seam_boundary_conditions(
+                    knot_xy, dc, M_free, free_idx,
+                    n_par, ns, nd,
+                    seam_radius_px=seam_radius_px,
+                )
+            # seam_keep is relative to the free_idx that entered the seam call
+            # (already reduced by medial BC), so index into the surviving positions.
+            keep_cumulative[keep_cumulative] = seam_keep
+            merge_map.update(seam_merge_map)
+
+        if _q0 is not None:
+            _q0 = _q0[keep_cumulative]
+
         self._last_merge_map = merge_map
-        # Store post-BC free_idx so the hierarchical loop reads the correct
-        # length when building q0 for the next level via _upsample_grid.
-        self._last_free_idx = free_idx
+        self._last_free_idx  = free_idx
 
         if _q0 is not None:
             q0 = _q0
@@ -890,37 +1225,55 @@ class SDCorrectedImage(PathCorrectedImage):
             p0 = np.clip(bin_grid.ravel()[free_idx].copy(), 1e-6, None)
             q0 = np.log(p0)
 
-        if objective == 'std':
-            def obj_fn(q):
-                return self._objective_std(q, M_free, fixed_contrib, v_opt,
-                                        free_idx, ns, nd, lam_smooth, lam_drift)
-        else:
-            gr_full = np.sqrt(sobel(self.pixel_array, axis=0)**2 +
-                            sobel(self.pixel_array, axis=1)**2)
-            g_opt        = gr_full[opt_r, opt_c].astype(np.float64)
-            d_opt_n      = d_norm[opt_r, opt_c]
-            depth_weight = np.clip(
-                1.0 - (d_opt_n - depth_threshold) / (1.0 - depth_threshold), 0.05, 1.0
-            )
-            def obj_fn(q):
-                return self._objective_entropy(q, M_free, fixed_contrib, v_opt, g_opt,
-                                            free_idx, ns, nd, lam_smooth, lam_drift,
-                                            depth_weight, n_bins, hist_smooth_sigma,
-                                            adaptive_bandwidth)
+        def obj_fn(q):
+            return self._objective_std(q, M_free, fixed_contrib, v_opt,
+                                    free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift)
 
         print(f"Optimizing [{objective}] with [{solver}]…", flush=True)
         t1 = time.time()
 
         if solver == 'trust-ncg':
+            # Original Trust-NCG path — unchanged.
             def hessp_fn(q, vec):
                 return self._hessp_std(q, vec, M_free, fixed_contrib, v_opt,
-                                    free_idx, ns, nd, lam_smooth, lam_drift)
+                                    free_idx, ns, nd, lam_smooth_d, lam_smooth_s, lam_drift, mu=0.0)
             result = minimize(
                 obj_fn, q0, jac=True, method='trust-ncg',
                 hessp=hessp_fn,
                 options={'maxiter': max_iter, 'gtol': gtol}
             )
+
+        elif solver == 'lm':
+            # ── Levenberg–Marquardt ───────────────────────────────────────────────
+            # Determine initial damping μ₀.
+            if lm_tau > 0.0:
+                # Scale by the gradient norm at the starting point so that μ₀
+                # is commensurate with the actual curvature scale of the problem.
+                _, g0 = obj_fn(q0)
+                mu0_actual = lm_tau * float(np.linalg.norm(g0))
+                print(f"  LM μ₀ = lm_tau · ‖g₀‖ = {lm_tau} · {np.linalg.norm(g0):.3g}"
+                    f" = {mu0_actual:.3g}", flush=True)
+            else:
+                mu0_actual = lm_mu0
+
+            # Factory: returns a damped hessp callable for a given μ.
+            def hessp_fn_factory(mu):
+                def hessp(q, vec):
+                    return self._hessp_std(
+                        q, vec, M_free, fixed_contrib, v_opt,
+                        free_idx, ns, nd,  lam_smooth_d, lam_smooth_s, lam_drift, mu=mu
+                    )
+                return hessp
+
+            result = self._lm_minimize(
+                q0, obj_fn, hessp_fn_factory,
+                max_iter=max_iter,
+                gtol=gtol,
+                mu0=mu0_actual,
+            )
+
         else:
+            # Original L-BFGS-B path — unchanged.
             log_lb = np.log(field_bounds[0]) if field_bounds[0] > 0 else -np.inf
             log_ub = np.log(field_bounds[1]) if np.isfinite(field_bounds[1]) else np.inf
             log_bounds = [(log_lb, log_ub)] * len(free_idx)
@@ -935,7 +1288,6 @@ class SDCorrectedImage(PathCorrectedImage):
 
         opt_par            = np.ones(n_par, dtype=np.float64)
         opt_par[free_idx]  = np.exp(result.x)
-        # Restore merged (follower) knots from their leader's optimised value
         for follower_flat, leader_flat in merge_map.items():
             opt_par[follower_flat] = opt_par[leader_flat]
 
@@ -948,189 +1300,7 @@ class SDCorrectedImage(PathCorrectedImage):
                             field_bounds[0], field_bounds[1])
 
         return self._apply_field(field), field, result
-
-    def _upsample_grid(self, p_opt_coarse, free_idx_coarse,
-                    sc_coarse, dc_coarse,
-                    sc_fine,   dc_fine,
-                    ns_coarse, nd_coarse,
-                    ns_fine,   nd_fine,
-                    free_idx_fine):
-        """
-        Upsamples a coarse grid solution to initialize a fine grid.
-
-        Parameters
-        ----------
-        p_opt_coarse  : (n_free_coarse,) optimal p values from coarse level
-        free_idx_coarse / _fine : index arrays of free (non-BC) knots
-        sc_coarse, dc_coarse    : coarse knot centres (1-D arrays)
-        sc_fine,   dc_fine      : fine   knot centres (1-D arrays)
-        ns_*, nd_*              : grid dimensions at each level
-
-        Returns
-        -------
-        q0_fine : (n_free_fine,) warm-start in log-space for the fine level
-        """
-        from scipy.interpolate import RectBivariateSpline
-
-        # Reconstruct the full coarse grid.
-        # free_idx_coarse is the post-BC index array: it contains only leader
-        # flat indices (followers were removed by _apply_medial_boundary_conditions).
-        # Followers must be restored from their leader before we can reshape into
-        # a 2-D grid for spline fitting.
-        n_par_coarse  = ns_coarse * nd_coarse
-        p_full_coarse = np.ones(n_par_coarse, dtype=np.float64)
-        p_full_coarse[free_idx_coarse] = p_opt_coarse
-
-        # Propagate leaders → followers using the stored merge_map
-        merge_map = getattr(self, '_last_merge_map', {}) or {}
-        for follower_flat, leader_flat in merge_map.items():
-            if follower_flat < n_par_coarse:
-                p_full_coarse[follower_flat] = p_full_coarse[leader_flat]
-
-        G_coarse = p_full_coarse.reshape(ns_coarse, nd_coarse)
-
-        # Fit a spline to the coarse grid values
-        spl = RectBivariateSpline(sc_coarse, dc_coarse, G_coarse, kx=3, ky=3)
-
-        # Evaluate at all fine knot positions
-        n_par_fine = ns_fine * nd_fine
-        p_full_fine = np.ones(n_par_fine, dtype=np.float64)
-
-        ss, dd = np.meshgrid(sc_fine, dc_fine, indexing='ij')   # (ns_fine, nd_fine)
-        G_fine = spl.ev(ss.ravel(), dd.ravel()).reshape(ns_fine, nd_fine)
-
-        # Clip to a safe positive range before taking log
-        G_fine = np.clip(G_fine, 1e-6, None)
-        p_full_fine = G_fine.ravel()
-
-        # Return only the free (non-BC) knots, encoded in log-space
-        q0_fine = np.log(p_full_fine[free_idx_fine])
-        return q0_fine
     
-    def correct_sd_optimized_hierarchical(
-        self,
-        objective         = 'entropy',
-        levels            = None,
-        opt_stride        = 4,
-        lam_smooth        = 0.15,
-        lam_drift         = 0.10,
-        field_bounds      = (0.2, 3.0),
-        max_iter_coarse   = 100,
-        max_iter_fine     = 300,
-        ftol              = 1e-9,
-        gtol              = 1e-6,
-        depth_threshold   = 0.35,
-        n_bins            = 32,
-        hist_smooth_sigma = 1.5,
-        **kwargs
-    ):
-        """
-        Hierarchical multi-resolution correction.
-
-        Starts on a coarse grid and refines it, reducing the risk of local minima.
-
-        Parameters
-        ----------
-        levels : list of (ns, nd) tuples
-            Grid resolution stages.
-        max_iter_coarse, max_iter_fine : int
-            Iteration budgets.
-
-        Returns
-        -------
-        corrected_image : SDCorrectedImage
-        field : (H, W) array
-        results : list of OptimizeResult, one per level
-        """
-        if levels is None:
-            levels = [(6, 5), (13, 8)]
-
-        # Build sd-maps once here.  Every subsequent call to _build_sd_maps
-        # inside correct_sd_optimized will find the cache valid and return
-        # immediately (no recomputation).
-        self._build_sd_maps(**kwargs)
-
-        shared = dict(
-            objective         = objective,
-            opt_stride        = opt_stride,
-            lam_smooth        = lam_smooth,
-            lam_drift         = lam_drift,
-            field_bounds      = field_bounds,
-            ftol              = ftol,
-            gtol              = gtol,
-            depth_threshold   = depth_threshold,
-            n_bins            = n_bins,
-            hist_smooth_sigma = hist_smooth_sigma,
-        )
-
-        q_prev        = None   # log-space solution from the previous level
-        free_idx_prev = None
-        sc_prev       = None
-        dc_prev       = None
-        ns_prev       = None
-        nd_prev       = None
-        results       = []
-
-        for level_idx, (ns, nd) in enumerate(levels):
-            is_last  = (level_idx == len(levels) - 1)
-            max_iter = max_iter_fine if is_last else max_iter_coarse
-
-            print(f"\nLevel {level_idx + 1}/{len(levels)}  "
-                f"grid={ns}×{nd}  "
-                f"({'final' if is_last else 'coarse'})", flush=True)
-
-            # Warm start
-            if q_prev is None:
-                # First level: correct_sd_optimized will use its heuristic default.
-                q0 = None
-            else:
-                # Compute this level's knot positions (cheap — just quantile maths,
-                # no matrix build).  correct_sd_optimized will compute them again
-                # internally, but the duplication costs only milliseconds.
-                sc_cur, dc_cur = self._compute_adaptive_knots(ns, nd, **kwargs)
-
-                # free_idx for the current level: since _build_interp_matrix
-                # currently pins no BCs, this is always np.arange(ns * nd).
-                # We read it from the cache written by the previous
-                # correct_sd_optimized call, which is the robust way to get it
-                # should BCs ever be re-activated in _build_interp_matrix.
-                # For the very next level we must compute it before the call, so
-                # we derive it directly from ns/nd here.
-                free_idx_cur = np.arange(ns * nd)
-
-                q0 = self._upsample_grid(
-                    np.exp(q_prev), free_idx_prev,
-                    sc_prev, dc_prev,
-                    sc_cur,  dc_cur,
-                    ns_prev, nd_prev,
-                    ns,      nd,
-                    free_idx_cur,
-                )
-
-            # Run the existing single-level optimiser
-            # M is built exactly once here; _build_sd_maps hits the cache.
-            # After this call, self._last_sc / _dc / _free_idx hold this level's
-            # knots and free indices, ready for the next upsample step.
-            _, field, result = self.correct_sd_optimized(
-                ns       = ns,
-                nd       = nd,
-                max_iter = max_iter,
-                _q0      = q0,
-                **shared,
-                **kwargs,
-            )
-            results.append(result)
-
-            # Carry solution forward — read from cache, no rebuild
-            q_prev        = result.x            # already in log-space
-            sc_prev       = self._last_sc
-            dc_prev       = self._last_dc
-            free_idx_prev = self._last_free_idx
-            ns_prev, nd_prev = ns, nd
-
-        corrected_image = self._apply_field(field)
-        return corrected_image, field, results
-
     def visualize_correction(
         self,
         field,
@@ -1277,9 +1447,9 @@ class SDCorrectedImage(PathCorrectedImage):
 
         # [0,2] Field on breast + knot scatter
         ax_field.imshow(img_orig, cmap='gray', vmin=vmin_img, vmax=vmax_img,
-                        origin='upper', interpolation='nearest', alpha=0.45)
+                        origin='upper', interpolation='nearest')
         im_f = ax_field.imshow(field_display, cmap=cmap_f, norm=norm_f,
-                            origin='upper', interpolation='nearest', alpha=0.75)
+                            origin='upper', interpolation='nearest')
         ax_field.scatter(kc_flat, kr_flat, c=kv_flat, cmap=cmap_f, norm=norm_f,
                         s=30, edgecolors='k', linewidths=0.5, zorder=5)
         cb_f = fig.colorbar(im_f, ax=ax_field, fraction=0.046, pad=0.04)
@@ -1290,7 +1460,7 @@ class SDCorrectedImage(PathCorrectedImage):
 
         # [1,0] Knot grid in image space — edge colour encodes BC group membership
         ax_knots.imshow(img_orig, cmap='gray', vmin=vmin_img, vmax=vmax_img,
-                        origin='upper', interpolation='nearest', alpha=0.65)
+                        origin='upper', interpolation='nearest')
         for i in range(ns):
             ax_knots.plot(knot_c[i, :], knot_r[i, :],
                         color='steelblue', linewidth=0.7, alpha=0.6, zorder=3)
@@ -1442,8 +1612,3 @@ class SDCorrectedImage(PathCorrectedImage):
             print(f'Saved to {save_path}')
         plt.show()
         return fig, (ax_orig, ax_corr, ax_field, ax_knots, ax_sd, ax_profile)
-    
-
-if __name__=="__main__":
-    img = SDCorrectedImage(dicom_path=r"C:\Users\Santeri\OneDrive - University of Helsinki\Desktop\BIBCorrection\Non-suppressed\85\I1225")
-    img._compute_adaptive_knots(15,10)
