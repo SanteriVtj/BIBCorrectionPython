@@ -209,14 +209,13 @@ class SDCorrectedImage(PathCorrectedImage):
     
     def _compute_adaptive_knots(self, ns, nd,
                 s_margin=0.01,
-                d_margin=0.005,
+                d_margin=0.01,
                 d_strategy='gradient',
                 d_beta_a=0.6,
                 d_beta_b=2.5,
                 knot_smooth_sigma=5.0,
                 knot_weight_floor=0.05,
-                min_strip_pixels=10,
-                n_d_probe=100,
+                top_bottom_cut=.25,
                 **kwargs):
             """
             Sizes the spline grid (knots) adaptively based on the breast shape.
@@ -254,7 +253,15 @@ class SDCorrectedImage(PathCorrectedImage):
             self._build_sd_maps(**kwargs)
             mask   = self._sd_mask
             s_flat = self._sd_s_norm[mask].astype(np.float64)
-            d_flat = self._sd_d_norm[mask].astype(np.float64)
+            
+            height,_ = mask.shape
+            h0 = int(top_bottom_cut*height)
+            h1 = int((1-top_bottom_cut)*height)
+            cut_mask = mask[h0:h1,:]
+            
+            d_flat = self._sd_d_norm[h0:h1,:]
+            d_flat = d_flat[cut_mask].astype(np.float64)
+
 
             # s-knots: quantile spacing for equal coverage
             s_lo = float(np.percentile(s_flat, 100.0 * s_margin))
@@ -290,13 +297,15 @@ class SDCorrectedImage(PathCorrectedImage):
                     [d_hi + 1e-9],
                 ])
 
-                if hasattr(self, '_last_field') and self._last_field is not None:
-                    f_flat = self._last_field[mask].astype(np.float64)
-                else:
-                    v      = self.pixel_array[mask].astype(np.float64)
-                    v_med  = np.median(v)
-                    f_flat = v_med / (v + 1e-8)
-
+                # if hasattr(self, '_last_field') and self._last_field is not None:
+                #     f_flat = self._last_field[mask].astype(np.float64)
+                # else:
+                    # v      = self.pixel_array[mask].astype(np.float64)
+                v = self.pixel_array[h0:h1,:]
+                v      = v[cut_mask].astype(np.float64)
+                v_med  = np.median(v)
+                f_flat = v_med / (v + 1e-8)
+                
                 f_profile = np.array([
                     f_flat[(d_flat >= d_edges[b]) & (d_flat < d_edges[b + 1])].mean()
                     if ((d_flat >= d_edges[b]) & (d_flat < d_edges[b + 1])).any()
@@ -322,9 +331,9 @@ class SDCorrectedImage(PathCorrectedImage):
                 weight = weight + knot_weight_floor * weight.max()
                 weight = np.maximum(weight, 0.0)
 
-                cdf         = np.cumsum(weight)
-                cdf         = (cdf - cdf[0]) / (cdf[-1] - cdf[0] + 1e-12)
-                dc          = np.interp(np.linspace(0.0, 1.0, nd), cdf, d_grid)
+                cdf = np.cumsum(weight)
+                cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
+                dc = np.interp(np.linspace(0.0, 1.0, nd), cdf, d_grid)
 
             elif d_strategy == 'beta':
                 uniform = np.linspace(0.0, 1.0, nd)
@@ -337,41 +346,10 @@ class SDCorrectedImage(PathCorrectedImage):
                     f"'beta'; got '{d_strategy}'."
                 )
 
-            # Prevent knot overlap near the medial axis
-            # shell_half = 0.5 / n_d_probe
-            # d_probe    = np.linspace(d_lo, d_hi, n_d_probe)
-
-            # # Assign every masked pixel to its nearest s-column
-            # col_assign = np.argmin(
-            #     np.abs(s_flat[:, None] - sc[None, :]), axis=1
-            # )
-
-            # safe_d_hi = d_hi
-            # for d_level in reversed(d_probe):
-            #     in_shell = (
-            #         (d_flat >= d_level - shell_half) &
-            #         (d_flat <= d_level + shell_half)
-            #     )
-            #     all_ok = all(
-            #         int(np.sum(in_shell & (col_assign == i))) >= min_strip_pixels
-            #         for i in range(ns)
-            #     )
-            #     if all_ok:
-            #         safe_d_hi = float(d_level)
-            #         break
-
-            # d_hi = min(d_hi, safe_d_hi)
-
             # Enforce strict monotonicity
-            # dc[0]  = d_lo;  dc[-1]  = d_hi
-            # dc = np.maximum.accumulate(dc)
-            # dc = np.minimum.accumulate(dc[::-1])[::-1]
-            if not np.all(np.diff(dc) > 0):
-                eps = np.finfo(float).eps * (d_hi - d_lo) * nd
-                for i in range(1, len(dc)):
-                    if dc[i] <= dc[i - 1]:
-                        dc[i] = dc[i - 1] + eps
-                dc[-1] = d_hi  # restore the hard upper bound
+            dc[0]  = d_lo;  dc[-1]  = d_hi
+            dc = np.maximum.accumulate(dc)
+            dc = np.minimum.accumulate(dc[::-1])[::-1]
 
             return sc, dc
 
@@ -804,71 +782,118 @@ class SDCorrectedImage(PathCorrectedImage):
 
 
 
+    # def _hessp_std(self, q, vec, M_free, fixed_contrib, v_opt,
+    #             free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, mu=0.0):
+
+    #     fp     = np.exp(q)
+    #     fv     = M_free @ fp + fixed_contrib
+    #     n_par  = ns * nd
+    #     n_free = len(free_idx)
+
+    #     mu_v    = v_opt.mean()
+    #     mu_vf   = (v_opt * fv).mean()
+    #     alpha   = mu_v / (mu_vf + 1e-12)
+    #     fv_norm = alpha * fv
+    #     u       = v_opt * fv_norm
+    #     mu_u    = u.mean()
+    #     N       = len(u)
+    #     sigma   = np.std(u) + 1e-12
+
+    #     g_data      = v_opt * (u - mu_u) / (N * sigma)
+    #     grad_data_p = alpha * (
+    #         M_free.T @ g_data
+    #         - (np.dot(fv_norm, g_data) / (N * mu_v)) * (M_free.T @ v_opt)
+    #     )
+
+    #     # ── p-space direction ────────────────────────────────────────────────────
+    #     p_vec = fp * vec
+
+    #     # ── Data Hessian-vector product (Gauss-Newton, p-space) ──────────────────
+    #     Mv    = M_free @ p_vec
+    #     term1 = (alpha**2 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
+    #     term2 = -(alpha**2 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
+    #     term3 = -(alpha**2 / (N * sigma**2)) * (M_free.T @ (v_opt * (u - mu_u))) * (g_data @ Mv)
+    #     H_data_p_pvec = term1 + term2 + term3
+
+    #     # Convert data term to q-space: H^q z = p⊙(H^p(p⊙z)) + ∇_p L ⊙ p ⊙ z
+    #     H_data_q = fp * H_data_p_pvec + grad_data_p * fp * vec
+
+    #     # ── Asymmetric smoothness Hessian-vector product ──────────────────────────
+    #     # Expand vec into the full (ns, nd) grid, with fixed knots at 0.
+    #     v_full           = np.zeros(n_par, dtype=np.float64)
+    #     v_full[free_idx] = vec
+    #     v_grid           = v_full.reshape(ns, nd)
+
+    #     # s-direction: accumulate with lam_smooth_s
+    #     dvs    = np.diff(v_grid, axis=0)
+    #     dv_s   = np.zeros((ns, nd), dtype=np.float64)
+    #     dv_s[1:,  :] += 2 * dvs
+    #     dv_s[:-1, :] -= 2 * dvs
+
+    #     # d-direction: accumulate with lam_smooth_d
+    #     dvd    = np.diff(v_grid, axis=1)
+    #     dv_d   = np.zeros((ns, nd), dtype=np.float64)
+    #     dv_d[:,  1:] += 2 * dvd
+    #     dv_d[:,  :-1] -= 2 * dvd
+
+    #     # Combine with respective weights BEFORE indexing, mirroring _reg_and_grad
+    #     H_smooth_q = (dv_s.ravel() * lam_smooth_s +
+    #                 dv_d.ravel() * lam_smooth_d)[free_idx] / n_par
+
+    #     H_drift_q = 2.0 * lam_drift / n_free * vec
+
+    #     # μI is the LM shift; zero for Trust-NCG (default mu=0).
+    #     H_lm_q = mu * vec
+
+    #     return (H_data_q + H_smooth_q + H_drift_q + H_lm_q).astype(np.float64)
+    
+
     def _hessp_std(self, q, vec, M_free, fixed_contrib, v_opt,
-                free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, mu=0.0):
+                    free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, mu=0.0):
 
-        fp     = np.exp(q)
-        fv     = M_free @ fp + fixed_contrib
-        n_par  = ns * nd
-        n_free = len(free_idx)
+        fp  = np.exp(q)
+        fv  = M_free @ fp + fixed_contrib
 
-        mu_v    = v_opt.mean()
-        mu_vf   = (v_opt * fv).mean()
-        alpha   = mu_v / (mu_vf + 1e-12)
-        fv_norm = alpha * fv
-        u       = v_opt * fv_norm
-        mu_u    = u.mean()
-        N       = len(u)
-        sigma   = np.std(u) + 1e-12
+        corr   = v_opt * fv
+        mu_u   = corr.mean()
+        N      = len(corr)
+        sigma  = np.std(corr) + 1e-12
 
-        g_data      = v_opt * (u - mu_u) / (N * sigma)
-        grad_data_p = alpha * (
-            M_free.T @ g_data
-            - (np.dot(fv_norm, g_data) / (N * mu_v)) * (M_free.T @ v_opt)
-        )
+        g_data      = v_opt * (corr - mu_u) / (N * sigma)
+        grad_data_p = M_free.T @ g_data
 
-        # ── p-space direction ────────────────────────────────────────────────────
         p_vec = fp * vec
-
-        # ── Data Hessian-vector product (Gauss-Newton, p-space) ──────────────────
         Mv    = M_free @ p_vec
-        term1 = (alpha**2 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
-        term2 = -(alpha**2 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
-        term3 = -(alpha**2 / (N * sigma**2)) * (M_free.T @ (v_opt * (u - mu_u))) * (g_data @ Mv)
+
+        term1        = (1.0 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
+        term2        = -(1.0 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
+        term3        = -(1.0 / (N * sigma**2)) * (M_free.T @ (v_opt * (corr - mu_u))) * (g_data @ Mv)
         H_data_p_pvec = term1 + term2 + term3
 
-        # Convert data term to q-space: H^q z = p⊙(H^p(p⊙z)) + ∇_p L ⊙ p ⊙ z
         H_data_q = fp * H_data_p_pvec + grad_data_p * fp * vec
 
-        # ── Asymmetric smoothness Hessian-vector product ──────────────────────────
-        # Expand vec into the full (ns, nd) grid, with fixed knots at 0.
-        v_full           = np.zeros(n_par, dtype=np.float64)
+        v_full           = np.zeros(ns * nd, dtype=np.float64)
         v_full[free_idx] = vec
         v_grid           = v_full.reshape(ns, nd)
 
-        # s-direction: accumulate with lam_smooth_s
-        dvs    = np.diff(v_grid, axis=0)
-        dv_s   = np.zeros((ns, nd), dtype=np.float64)
+        dvs  = np.diff(v_grid, axis=0)
+        dv_s = np.zeros((ns, nd), dtype=np.float64)
         dv_s[1:,  :] += 2 * dvs
         dv_s[:-1, :] -= 2 * dvs
 
-        # d-direction: accumulate with lam_smooth_d
-        dvd    = np.diff(v_grid, axis=1)
-        dv_d   = np.zeros((ns, nd), dtype=np.float64)
+        dvd  = np.diff(v_grid, axis=1)
+        dv_d = np.zeros((ns, nd), dtype=np.float64)
         dv_d[:,  1:] += 2 * dvd
         dv_d[:,  :-1] -= 2 * dvd
 
-        # Combine with respective weights BEFORE indexing, mirroring _reg_and_grad
         H_smooth_q = (dv_s.ravel() * lam_smooth_s +
-                    dv_d.ravel() * lam_smooth_d)[free_idx] / n_par
+                        dv_d.ravel() * lam_smooth_d)[free_idx] / (ns * nd)
 
-        H_drift_q = 2.0 * lam_drift / n_free * vec
-
-        # μI is the LM shift; zero for Trust-NCG (default mu=0).
-        H_lm_q = mu * vec
+        H_drift_q = 2.0 * lam_drift / len(free_idx) * vec
+        H_lm_q    = mu * vec
 
         return (H_data_q + H_smooth_q + H_drift_q + H_lm_q).astype(np.float64)
-    
+
     def _lm_minimize(self, q0, obj_fn, hessp_fn_factory,
                     max_iter, gtol,
                     mu0=1e-3, mu_min=1e-12, mu_max=1e12):
@@ -941,19 +966,19 @@ class SDCorrectedImage(PathCorrectedImage):
             def matvec(v):
                 return hessp_mu(q, v)
 
-            A     = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
+            A = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
             delta, cg_info = sparse_cg(A, -g, rtol=cg_tol, maxiter=cg_maxiter)
 
             # Predicted reduction from quadratic model
             # pred = −g·δ − ½ δ·(H+μI)δ
             # We reuse the Hessian-vector product rather than recomputing it.
-            Hd        = hessp_mu(q, delta)
+            Hd = hessp_mu(q, delta)
             predicted = -(g @ delta) - 0.5 * (delta @ Hd)
 
             # Actual reduction
-            q_new        = q + delta
+            q_new = q + delta
             f_new, g_new = obj_fn(q_new)
-            actual       = f - f_new
+            actual = f - f_new
 
             nit += 1
 
@@ -998,29 +1023,49 @@ class SDCorrectedImage(PathCorrectedImage):
         )
 
 
+    # def _objective_std(self, q, M_free, fixed_contrib, v_opt,
+    #                 free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift):
+    #     """
+    #     Standard deviation objective function for L-BFGS optimization.
+    #     """
+    #     fp      = np.exp(q)
+    #     fv      = M_free @ fp + fixed_contrib
+
+    #     mu_v    = v_opt.mean()
+    #     mu_vf   = (v_opt * fv).mean()
+    #     alpha   = mu_v / (mu_vf + 1e-12)
+    #     fv_norm = alpha * fv
+
+    #     corr  = v_opt * fv_norm
+    #     mu    = corr.mean()
+    #     nm    = len(corr)
+    #     sigma = np.std(corr)
+
+    #     g           = v_opt * (corr - mu) / (nm * sigma + 1e-12)
+    #     grad_data_p = alpha * (
+    #         M_free.T @ g
+    #         - (np.dot(fv_norm, g) / (nm * mu_v)) * (M_free.T @ v_opt)
+    #     )
+    #     grad_data_q = grad_data_p * fp
+
+    #     reg_loss, g_reg_q = self._reg_and_grad(
+    #         q, free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift
+    #     )
+    #     return float(sigma) + reg_loss, (grad_data_q + g_reg_q).astype(np.float64)
+
     def _objective_std(self, q, M_free, fixed_contrib, v_opt,
-                    free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift):
-        """
-        Standard deviation objective function for L-BFGS optimization.
-        """
-        fp      = np.exp(q)
-        fv      = M_free @ fp + fixed_contrib
+                        free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift):
 
-        mu_v    = v_opt.mean()
-        mu_vf   = (v_opt * fv).mean()
-        alpha   = mu_v / (mu_vf + 1e-12)
-        fv_norm = alpha * fv
+        fp  = np.exp(q)
+        fv  = M_free @ fp + fixed_contrib
 
-        corr  = v_opt * fv_norm
+        corr  = v_opt * fv
         mu    = corr.mean()
         nm    = len(corr)
         sigma = np.std(corr)
 
         g           = v_opt * (corr - mu) / (nm * sigma + 1e-12)
-        grad_data_p = alpha * (
-            M_free.T @ g
-            - (np.dot(fv_norm, g) / (nm * mu_v)) * (M_free.T @ v_opt)
-        )
+        grad_data_p = M_free.T @ g
         grad_data_q = grad_data_p * fp
 
         reg_loss, g_reg_q = self._reg_and_grad(
@@ -1093,10 +1138,6 @@ class SDCorrectedImage(PathCorrectedImage):
         max_iter           = 300,
         ftol               = 1e-9,
         gtol               = 1e-6,
-        depth_threshold    = 0.35,
-        n_bins             = 32,
-        hist_smooth_sigma  = 1.5,
-        adaptive_bandwidth = True,
         _q0                = None,
         solver             = 'lbfgsb',
         bc_radius_px       = 0.0,
@@ -1162,6 +1203,11 @@ class SDCorrectedImage(PathCorrectedImage):
         s_opt = s_norm[opt_r, opt_c].astype(np.float64)
         d_opt = d_norm[opt_r, opt_c].astype(np.float64)
         v_opt = self.pixel_array[opt_r, opt_c].astype(np.float64)
+        # Pre-normalize v_opt so that a field of all-ones gives the right mean.
+        # This replaces the per-iteration alpha normalization in the objective,
+        # making the loss sensitive to the absolute scale of the field.
+        v_opt_mean = float(v_opt.mean())
+        v_opt = v_opt / (v_opt_mean + 1e-12)
         n_par = ns * nd
 
         print(f"Building M ({len(v_opt)} pixels × {n_par} params)…", flush=True)
@@ -1273,7 +1319,7 @@ class SDCorrectedImage(PathCorrectedImage):
             )
 
         else:
-            # Original L-BFGS-B path — unchanged.
+            # Original L-BFGS-B path
             log_lb = np.log(field_bounds[0]) if field_bounds[0] > 0 else -np.inf
             log_ub = np.log(field_bounds[1]) if np.isfinite(field_bounds[1]) else np.inf
             log_bounds = [(log_lb, log_ub)] * len(free_idx)
