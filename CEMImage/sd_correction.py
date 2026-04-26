@@ -83,7 +83,7 @@ class SDCorrectedImage(PathCorrectedImage):
             _sd_d_norm
             _sd_s_norm
         """
-        from scipy.ndimage import distance_transform_edt, binary_erosion, gaussian_filter
+        from scipy.ndimage import distance_transform_edt, binary_erosion, gaussian_filter, gaussian_filter1d
         from scipy.spatial import KDTree
         from skimage.measure import find_contours
 
@@ -105,11 +105,28 @@ class SDCorrectedImage(PathCorrectedImage):
         mask[:,-mask_to_boundary:] = np.repeat(np.any(mask[:,-mask_to_boundary:], axis=1)[:,np.newaxis], mask_to_boundary, axis=1)
         self._sd_mask = mask
 
+        # # Boundary contour
+        # contours = find_contours(mask.astype(float), 0.99)
+        # if not contours:
+        #     raise ValueError("No breast contour found — cannot build (s,d) maps.")
+        # boundary = max(contours, key=len)   # (N, 2) in (row, col)
+        # self._sd_boundary = boundary
+
+
         # Boundary contour
         contours = find_contours(mask.astype(float), 0.99)
         if not contours:
             raise ValueError("No breast contour found — cannot build (s,d) maps.")
         boundary = max(contours, key=len)   # (N, 2) in (row, col)
+
+        # Smooth the contour to remove pixel-grid kinks that cause s-jumps
+        boundary_smooth_sigma = kwargs.get('boundary_smooth_sigma', 150.0)
+        if boundary_smooth_sigma > 0:
+            boundary = np.stack([
+                gaussian_filter1d(boundary[:, 0], sigma=boundary_smooth_sigma),
+                gaussian_filter1d(boundary[:, 1], sigma=boundary_smooth_sigma),
+            ], axis=1)
+
         self._sd_boundary = boundary
 
         # Set 0 and 1 coordinates for s
