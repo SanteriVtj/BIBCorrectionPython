@@ -55,6 +55,11 @@ class SDCorrectedImage(PathCorrectedImage):
         self._sd_s_origin = None
         self._sd_s_end = None
         self._last_field = None
+        self._opt_cache = {}   # caches expensive geometry for correct_sd_optimized
+
+    def clear_opt_cache(self):
+        """Clears the cached geometry used by correct_sd_optimized."""
+        self._opt_cache.clear()
 
     def _build_sd_maps(
             self,
@@ -1190,96 +1195,143 @@ class SDCorrectedImage(PathCorrectedImage):
         if solver in ('trust-ncg', 'lm') and objective != 'std':
             raise ValueError(f"solver='{solver}' is only supported with objective='std'.")
 
-        print("Building the s-d-map")
-        t_build = time.time()
-        self._build_sd_maps(**kwargs)
-        print(f"  done in {time.time()-t_build:.1f}s", flush=True)
-
-        mask   = self._sd_mask
-        s_norm = self._sd_s_norm
-        d_norm = self._sd_d_norm
-        rows, cols = self.pixel_array.shape
-
-        kx = min(3, ns - 1)
-        ky = min(3, nd - 1)
-
-        print("Computing knot locations")
-        t_knots = time.time()
-        sc, dc = self._compute_adaptive_knots(ns, nd, **kwargs)
-        print(f"  done in {time.time()-t_knots:.1f}s", flush=True)
-
-        opt_r, opt_c = np.where(mask[::opt_stride, ::opt_stride])
-        opt_r = np.clip(opt_r * opt_stride, 0, rows - 1)
-        opt_c = np.clip(opt_c * opt_stride, 0, cols - 1)
-
-        s_opt = s_norm[opt_r, opt_c].astype(np.float64)
-        d_opt = d_norm[opt_r, opt_c].astype(np.float64)
-        v_opt = self.pixel_array[opt_r, opt_c].astype(np.float64)
-        # Pre-normalize v_opt so that a field of all-ones gives the right mean.
-        # This replaces the per-iteration alpha normalization in the objective,
-        # making the loss sensitive to the absolute scale of the field.
-        v_opt_mean = float(v_opt.mean())
-        v_opt = v_opt / (v_opt_mean + 1e-12)
-        n_par = ns * nd
-
-        print(f"Building M ({len(v_opt)} pixels × {n_par} params)…", flush=True)
-        t0 = time.time()
-        M_free, free_idx, fixed_contrib, bc_idx = self._build_interp_matrix(
-            sc, dc, s_opt, d_opt, ns, nd
+        # ── Cache key: structural parameters that determine the geometry ──────
+        # Regularization / solver parameters are intentionally excluded so that
+        # re-running with different lambdas reuses all expensive precomputation.
+        _cache_key = (
+            ns, nd, opt_stride,
+            bc_radius_px, seam_radius_px, d_bc_thresh,
+            tuple(sorted(
+                (k, v) for k, v in kwargs.items()
+                if k not in ('field_bounds',)
+            )),
         )
-        print(f"  done in {time.time()-t0:.1f}s  ({len(free_idx)} free params)", flush=True)
+        _cache = self._opt_cache.get(_cache_key)
 
-        self._last_sc = sc
-        self._last_dc = dc
-
-        merge_map  = {}
-        knot_xy    = self._compute_knot_positions(sc, dc, opt_r, opt_c, s_opt, d_opt)
-        self._last_knot_xy = knot_xy
-
-        # Cumulative boolean mask over the original free_idx.
-        # Each BC call returns a keep mask relative to the free_idx it received,
-        # so we compose them by indexing into the running mask.
-        keep_cumulative = np.ones(len(free_idx), dtype=bool)
-
-        if bc_radius_px > 0.0:
-            M_free, free_idx, medial_merge_map, medial_keep = \
-                self._apply_medial_boundary_conditions(
-                    knot_xy, dc, M_free, free_idx,
-                    n_par, ns, nd,
-                    d_bc_thresh=d_bc_thresh,
-                    bc_radius_px=bc_radius_px,
-                )
-            # medial_keep is relative to the free_idx that entered the medial call,
-            # which still corresponds 1-to-1 with keep_cumulative's True positions.
-            keep_cumulative[keep_cumulative] = medial_keep
-            merge_map.update(medial_merge_map)
-
-        if seam_radius_px > 0.0:
-            M_free, free_idx, seam_merge_map, seam_keep = \
-                self._apply_seam_boundary_conditions(
-                    knot_xy, dc, M_free, free_idx,
-                    n_par, ns, nd,
-                    seam_radius_px=seam_radius_px,
-                )
-            # seam_keep is relative to the free_idx that entered the seam call
-            # (already reduced by medial BC), so index into the surviving positions.
-            keep_cumulative[keep_cumulative] = seam_keep
-            merge_map.update(seam_merge_map)
-
-        if _q0 is not None:
-            _q0 = _q0[keep_cumulative]
-
-        self._last_merge_map = merge_map
-        self._last_free_idx  = free_idx
-
-        if _q0 is not None:
-            q0 = _q0
+        if _cache is not None:
+            print("Reusing cached geometry (sd maps, knots, M, BCs).", flush=True)
+            sc            = _cache['sc']
+            dc            = _cache['dc']
+            mask          = _cache['mask']
+            s_norm        = _cache['s_norm']
+            d_norm        = _cache['d_norm']
+            M_free        = _cache['M_free']
+            free_idx      = _cache['free_idx']
+            fixed_contrib = _cache['fixed_contrib']
+            v_opt         = _cache['v_opt']
+            merge_map     = _cache['merge_map']
+            knot_xy       = _cache['knot_xy']
+            keep_cumulative = _cache['keep_cumulative']
+            n_par         = _cache['n_par']
+            bin_grid      = _cache['bin_grid']
+            rows, cols    = self.pixel_array.shape
         else:
+            print("Building the s-d-map")
+            t_build = time.time()
+            self._build_sd_maps(**kwargs)
+            print(f"  done in {time.time()-t_build:.1f}s", flush=True)
+
+            mask   = self._sd_mask
+            s_norm = self._sd_s_norm
+            d_norm = self._sd_d_norm
+            rows, cols = self.pixel_array.shape
+
+            print("Computing knot locations")
+            t_knots = time.time()
+            sc, dc = self._compute_adaptive_knots(ns, nd, **kwargs)
+            print(f"  done in {time.time()-t_knots:.1f}s", flush=True)
+
+            opt_r, opt_c = np.where(mask[::opt_stride, ::opt_stride])
+            opt_r = np.clip(opt_r * opt_stride, 0, rows - 1)
+            opt_c = np.clip(opt_c * opt_stride, 0, cols - 1)
+
+            s_opt = s_norm[opt_r, opt_c].astype(np.float64)
+            d_opt = d_norm[opt_r, opt_c].astype(np.float64)
+            v_opt = self.pixel_array[opt_r, opt_c].astype(np.float64)
+            # Pre-normalize v_opt so that a field of all-ones gives the right mean.
+            # This replaces the per-iteration alpha normalization in the objective,
+            # making the loss sensitive to the absolute scale of the field.
+            v_opt_mean = float(v_opt.mean())
+            v_opt = v_opt / (v_opt_mean + 1e-12)
+            n_par = ns * nd
+
+            print(f"Building M ({len(v_opt)} pixels × {n_par} params)…", flush=True)
+            t0 = time.time()
+            M_free, free_idx, fixed_contrib, bc_idx = self._build_interp_matrix(
+                sc, dc, s_opt, d_opt, ns, nd
+            )
+            print(f"  done in {time.time()-t0:.1f}s  ({len(free_idx)} free params)", flush=True)
+
+            merge_map  = {}
+            knot_xy    = self._compute_knot_positions(sc, dc, opt_r, opt_c, s_opt, d_opt)
+
+            # Cumulative boolean mask over the original free_idx.
+            # Each BC call returns a keep mask relative to the free_idx it received,
+            # so we compose them by indexing into the running mask.
+            keep_cumulative = np.ones(len(free_idx), dtype=bool)
+
+            if bc_radius_px > 0.0:
+                M_free, free_idx, medial_merge_map, medial_keep = \
+                    self._apply_medial_boundary_conditions(
+                        knot_xy, dc, M_free, free_idx,
+                        n_par, ns, nd,
+                        d_bc_thresh=d_bc_thresh,
+                        bc_radius_px=bc_radius_px,
+                    )
+                # medial_keep is relative to the free_idx that entered the medial call,
+                # which still corresponds 1-to-1 with keep_cumulative's True positions.
+                keep_cumulative[keep_cumulative] = medial_keep
+                merge_map.update(medial_merge_map)
+
+            if seam_radius_px > 0.0:
+                M_free, free_idx, seam_merge_map, seam_keep = \
+                    self._apply_seam_boundary_conditions(
+                        knot_xy, dc, M_free, free_idx,
+                        n_par, ns, nd,
+                        seam_radius_px=seam_radius_px,
+                    )
+                # seam_keep is relative to the free_idx that entered the seam call
+                # (already reduced by medial BC), so index into the surviving positions.
+                keep_cumulative[keep_cumulative] = seam_keep
+                merge_map.update(seam_merge_map)
+
+            # Compute the heuristic grid once (used as fallback initial guess)
             print("Computing the heuristic grid")
             t_grid = time.time()
             bin_grid = self._build_heuristic_grid(sc, dc, ns, nd,
                                                 field_bounds=field_bounds, **kwargs)
             print(f"  done in {time.time()-t_grid:.1f}s", flush=True)
+
+            # Store everything in the cache
+            self._opt_cache[_cache_key] = {
+                'sc': sc, 'dc': dc,
+                'mask': mask, 's_norm': s_norm, 'd_norm': d_norm,
+                'M_free': M_free, 'free_idx': free_idx,
+                'fixed_contrib': fixed_contrib,
+                'v_opt': v_opt,
+                'merge_map': merge_map,
+                'knot_xy': knot_xy,
+                'keep_cumulative': keep_cumulative,
+                'n_par': n_par,
+                'bin_grid': bin_grid,
+            }
+
+        # Update instance attributes (used by visualize_correction, etc.)
+        self._last_sc = sc
+        self._last_dc = dc
+        self._last_knot_xy = knot_xy
+        self._last_merge_map = merge_map
+        self._last_free_idx  = free_idx
+
+        kx = min(3, ns - 1)
+        ky = min(3, nd - 1)
+
+        if _q0 is not None:
+            _q0 = _q0[keep_cumulative]
+
+        if _q0 is not None:
+            q0 = _q0
+        else:
             p0 = np.clip(bin_grid.ravel()[free_idx].copy(), 1e-6, None)
             q0 = np.log(p0)
 
