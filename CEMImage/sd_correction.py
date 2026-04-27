@@ -735,7 +735,8 @@ class SDCorrectedImage(PathCorrectedImage):
 
         return M_free_bc, free_idx_bc, merge_map, keep
 
-    def _reg_and_grad(self, q, free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, debug=False):
+    def _reg_and_grad(self, q, free_idx=None, ns=None, nd=None,
+                       lam_smooth_s=None, lam_smooth_d=None, lam_drift=None, debug=False):
         """
         Computes the regularization loss and its gradient for spline grid parameters.
 
@@ -746,9 +747,35 @@ class SDCorrectedImage(PathCorrectedImage):
                         on p centered at 1 (neutral correction).
 
         Both terms have constant Hessians in q-space ((2λ_s/K)·L and (2λ_d/K_f)·I),
-        fully consistent with the log reparametrization. The alpha parameter is kept
-        in the signature for compatibility but is not used.
+        fully consistent with the log reparametrization.
+
+        In debug mode (debug=True), free_idx / ns / nd can be omitted and will
+        be resolved from the most recent optimization cache.  In normal mode
+        all arguments are required.
         """
+        # Resolve from cache when in debug mode
+        if free_idx is None or ns is None or nd is None:
+            if not debug:
+                raise ValueError(
+                    "free_idx, ns, and nd are required when debug=False."
+                )
+            if not self._opt_cache:
+                raise RuntimeError(
+                    "No cached optimization data. Run correct_sd_optimized first."
+                )
+            # Use the most recently added cache entry
+            _cached = next(reversed(self._opt_cache.values()))
+            if free_idx is None:
+                free_idx = _cached['free_idx']
+            if ns is None or nd is None:
+                ns = len(_cached['sc'])
+                nd = len(_cached['dc'])
+
+        if lam_smooth_s is None or lam_smooth_d is None or lam_drift is None:
+            raise ValueError(
+                "lam_smooth_s, lam_smooth_d, and lam_drift are required."
+            )
+
         n_par  = ns * nd
         n_free = len(free_idx)
 
@@ -771,8 +798,11 @@ class SDCorrectedImage(PathCorrectedImage):
         ds_ = np.diff(q2d, axis=0)   # shape (ns-1, nd) — s-direction differences
         dd_ = np.diff(q2d, axis=1)   # shape (ns, nd-1) — d-direction differences
 
-        smooth_loss = (lam_smooth_s * np.sum(ds_**2) +
-                    lam_smooth_d * np.sum(dd_**2)) / n_par
+        # smooth_loss = (lam_smooth_s * np.sum(ds_**2) +
+        #             lam_smooth_d * np.sum(dd_**2)) / n_par
+        smooth_loss_s = (lam_smooth_s * np.sum(ds_**2))/n_par
+        smooth_loss_d = (lam_smooth_d * np.sum(dd_**2)) / n_par
+        smooth_loss = smooth_loss_d+smooth_loss_s
 
         # s-direction gradient (axis=0): scale by lam_smooth_s
         dq_s = np.zeros((ns, nd), dtype=np.float64)
@@ -793,7 +823,7 @@ class SDCorrectedImage(PathCorrectedImage):
         drift_loss = lam_drift * np.mean(q**2)
         g_drift_q  = 2.0 * lam_drift * q / n_free
 
-        if debug: return smooth_loss, drift_loss
+        if debug: return smooth_loss_s, smooth_loss_d, drift_loss
 
         return float(smooth_loss + drift_loss), (g_smooth_q + g_drift_q)
 
@@ -1070,8 +1100,51 @@ class SDCorrectedImage(PathCorrectedImage):
     #     )
     #     return float(sigma) + reg_loss, (grad_data_q + g_reg_q).astype(np.float64)
 
-    def _objective_std(self, q, M_free, fixed_contrib, v_opt,
-                        free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift):
+    def _objective_std(self, q, M_free=None, fixed_contrib=None, v_opt=None,
+                        free_idx=None, ns=None, nd=None,
+                        lam_smooth_s=None, lam_smooth_d=None, lam_drift=None,
+                        debug=False):
+        """
+        Standard deviation objective function.
+
+        In debug mode (debug=True), only q and the three regularization
+        lambdas are required — everything else is resolved from the
+        optimization cache.  Returns (data_loss, smooth_loss_s,
+        smooth_loss_d, drift_loss) without gradients.
+
+        In normal mode all arguments are required.
+        """
+        _need_cache = (M_free is None or fixed_contrib is None or
+                       v_opt is None or free_idx is None or
+                       ns is None or nd is None)
+
+        if _need_cache:
+            if not debug:
+                raise ValueError(
+                    "All arguments are required when debug=False."
+                )
+            if not self._opt_cache:
+                raise RuntimeError(
+                    "No cached optimization data. Run correct_sd_optimized first."
+                )
+            _cached = next(reversed(self._opt_cache.values()))
+            if M_free is None:
+                M_free = _cached['M_free']
+            if fixed_contrib is None:
+                fixed_contrib = _cached['fixed_contrib']
+            if v_opt is None:
+                v_opt = _cached['v_opt']
+            if free_idx is None:
+                free_idx = _cached['free_idx']
+            if ns is None:
+                ns = len(_cached['sc'])
+            if nd is None:
+                nd = len(_cached['dc'])
+
+        if lam_smooth_s is None or lam_smooth_d is None or lam_drift is None:
+            raise ValueError(
+                "lam_smooth_s, lam_smooth_d, and lam_drift are required."
+            )
 
         fp  = np.exp(q)
         fv  = M_free @ fp + fixed_contrib
@@ -1080,6 +1153,13 @@ class SDCorrectedImage(PathCorrectedImage):
         mu    = corr.mean()
         nm    = len(corr)
         sigma = np.std(corr)
+
+        if debug:
+            smooth_s, smooth_d, drift = self._reg_and_grad(
+                q, free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift,
+                debug=True
+            )
+            return float(sigma), smooth_s, smooth_d, drift
 
         g           = v_opt * (corr - mu) / (nm * sigma + 1e-12)
         grad_data_p = M_free.T @ g
