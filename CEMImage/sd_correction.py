@@ -105,14 +105,6 @@ class SDCorrectedImage(PathCorrectedImage):
         mask[:,-mask_to_boundary:] = np.repeat(np.any(mask[:,-mask_to_boundary:], axis=1)[:,np.newaxis], mask_to_boundary, axis=1)
         self._sd_mask = mask
 
-        # # Boundary contour
-        # contours = find_contours(mask.astype(float), 0.99)
-        # if not contours:
-        #     raise ValueError("No breast contour found — cannot build (s,d) maps.")
-        # boundary = max(contours, key=len)   # (N, 2) in (row, col)
-        # self._sd_boundary = boundary
-
-
         # Boundary contour
         contours = find_contours(mask.astype(float), 0.99)
         if not contours:
@@ -120,7 +112,7 @@ class SDCorrectedImage(PathCorrectedImage):
         boundary = max(contours, key=len)   # (N, 2) in (row, col)
 
         # Smooth the contour to remove pixel-grid kinks that cause s-jumps
-        boundary_smooth_sigma = kwargs.get('boundary_smooth_sigma', 150.0)
+        boundary_smooth_sigma = kwargs.get('boundary_smooth_sigma', 250.0)
         if boundary_smooth_sigma > 0:
             boundary = np.stack([
                 gaussian_filter1d(boundary[:, 0], sigma=boundary_smooth_sigma),
@@ -145,8 +137,10 @@ class SDCorrectedImage(PathCorrectedImage):
         self._sd_s_end = s1   # image-frame point, s = total_span
 
         boundary_mask = np.full(mask.shape, False)
-        br = boundary.astype(int)[:,0]; bc = boundary.astype(int)[:,1]
+        br = np.clip(boundary.astype(int)[:, 0], 0, mask.shape[0] - 1)
+        bc = np.clip(boundary.astype(int)[:, 1], 0, mask.shape[1] - 1)
         boundary_mask[br,bc] = True
+        # return boundary_mask
 
         # Compute d-coordinates
         d_map_full, nearest_idx = distance_transform_edt(~boundary_mask, return_indices=True)
@@ -167,6 +161,7 @@ class SDCorrectedImage(PathCorrectedImage):
             arc_length_map[nearest_idx[0], nearest_idx[1]],
             0.0
         )
+
 
         self._sd_s_map = s_map_raw
         
