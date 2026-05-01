@@ -205,9 +205,9 @@ class SDCorrectedImage(PathCorrectedImage):
         from scipy.stats import binned_statistic_2d
 
         # Strategy: bin pixel intensities by (s, d) and estimate target from deep tissue
-        mask     = self._sd_mask
-        s_norm   = self._sd_s_norm
-        d_norm   = self._sd_d_norm
+        mask = self._sd_mask
+        s_norm = self._sd_s_norm
+        d_norm = self._sd_d_norm
 
         bin_cem, _, _, _ = binned_statistic_2d(
             s_norm[mask], d_norm[mask], self.pixel_array[mask],
@@ -268,10 +268,10 @@ class SDCorrectedImage(PathCorrectedImage):
             from scipy.ndimage import gaussian_filter1d
 
             self._build_sd_maps(**kwargs)
-            mask   = self._sd_mask
+            mask = self._sd_mask
             s_flat = self._sd_s_norm[mask].astype(np.float64)
             
-            height,_ = mask.shape
+            height, _ = mask.shape
             h0 = int(top_bottom_cut*height)
             h1 = int((1-top_bottom_cut)*height)
             cut_mask = mask[h0:h1,:]
@@ -287,13 +287,12 @@ class SDCorrectedImage(PathCorrectedImage):
             q_hi_s = float(np.mean(s_flat <= s_hi))
             sc = np.quantile(s_flat, np.linspace(q_lo_s, q_hi_s, ns))
             sc[0] = s_lo;  sc[-1] = s_hi
-            # sc = np.maximum.accumulate(sc)
-            # sc = np.minimum.accumulate(sc[::-1])[::-1]
             if not np.all(np.diff(sc) > 0):
                 eps = np.finfo(float).eps * (s_hi - s_lo) * nd
-                for i in range(1, len(sc)):
-                    if sc[i] <= sc[i - 1]:
-                        sc[i] = sc[i - 1] + eps
+                for i in range(1, len(sc)-1):
+                    if (sc[i] <= sc[i - 1]) or (sc[i] >= sc[i+1]):
+                        sc[i] = (sc[i-1] + sc[i+1])/2
+                        # sc[i] = sc[i - 1] + eps
                 sc[-1] = s_hi  # restore the hard upper bound
 
             # d-knots
@@ -306,21 +305,17 @@ class SDCorrectedImage(PathCorrectedImage):
                 dc = np.quantile(d_flat, np.linspace(q_lo_d, q_hi_d, nd))
 
             elif d_strategy in ('gradient', 'curvature'):
-                n_prof  = 200
-                d_grid  = np.linspace(d_lo, d_hi, n_prof)
+                n_prof = 200
+                d_grid = np.linspace(d_lo, d_hi, n_prof)
                 d_edges = np.concatenate([
                     [d_lo - 1e-9],
                     0.5 * (d_grid[:-1] + d_grid[1:]),
                     [d_hi + 1e-9],
                 ])
 
-                # if hasattr(self, '_last_field') and self._last_field is not None:
-                #     f_flat = self._last_field[mask].astype(np.float64)
-                # else:
-                    # v      = self.pixel_array[mask].astype(np.float64)
                 v = self.pixel_array[h0:h1,:]
-                v      = v[cut_mask].astype(np.float64)
-                v_med  = np.median(v)
+                v = v[cut_mask].astype(np.float64)
+                v_med = np.median(v)
                 f_flat = v_med / (v + 1e-8)
                 
                 f_profile = np.array([
@@ -354,8 +349,8 @@ class SDCorrectedImage(PathCorrectedImage):
 
             elif d_strategy == 'beta':
                 uniform = np.linspace(0.0, 1.0, nd)
-                warped  = beta_dist.ppf(uniform, d_beta_a, d_beta_b)
-                dc      = d_lo + warped * (d_hi - d_lo)
+                warped = beta_dist.ppf(uniform, d_beta_a, d_beta_b)
+                dc = d_lo + warped * (d_hi - d_lo)
 
             else:
                 raise ValueError(
@@ -364,7 +359,8 @@ class SDCorrectedImage(PathCorrectedImage):
                 )
 
             # Enforce strict monotonicity
-            dc[0]  = d_lo;  dc[-1]  = d_hi
+            dc[0] = d_lo
+            dc[-1] = d_hi
             dc = np.maximum.accumulate(dc)
             dc = np.minimum.accumulate(dc[::-1])[::-1]
 
@@ -376,21 +372,19 @@ class SDCorrectedImage(PathCorrectedImage):
         """
         from scipy.interpolate import RectBivariateSpline
 
-        n_par   = ns * nd
-        n_pix   = len(s_opt)
-        M       = np.zeros((n_pix, n_par), dtype=np.float64)
+        n_par = ns * nd
+        n_pix = len(s_opt)
+        M = np.zeros((n_pix, n_par), dtype=np.float64)
         impulse = np.zeros((ns, nd),       dtype=np.float64)
 
         for k in range(n_par):
-            ki, kj          = divmod(k, nd)
+            ki, kj = divmod(k, nd)
             impulse[ki, kj] = 1.0
-            M[:, k]         = RectBivariateSpline(
-                sc, dc, impulse, kx=3, ky=3
-            ).ev(s_opt, d_opt)
+            M[:, k] = RectBivariateSpline(sc, dc, impulse, kx=3, ky=3 ).ev(s_opt, d_opt)
             impulse[ki, kj] = 0.0
 
-        bc_idx        = np.array([], dtype=int)
-        free_idx      = np.arange(n_par)
+        bc_idx = np.array([], dtype=int)
+        free_idx = np.arange(n_par)
         fixed_contrib = np.zeros(n_pix, dtype=np.float64)
 
         fixed_contrib = M[:, bc_idx] @ np.ones(len(bc_idx), dtype=np.float64)
@@ -411,8 +405,8 @@ class SDCorrectedImage(PathCorrectedImage):
         ns, nd = len(sc), len(dc)
         se = np.concatenate([[0.0], 0.5 * (sc[:-1] + sc[1:]), [1.0]])
 
-        k_near   = 20
-        knot_xy  = np.zeros((ns, nd, 2), dtype=np.float64)
+        k_near = 20
+        knot_xy = np.zeros((ns, nd, 2), dtype=np.float64)
         for i in range(ns):
             in_strip = (s_opt >= se[i]) & (s_opt < se[i + 1])
             if not in_strip.any():
@@ -462,7 +456,7 @@ class SDCorrectedImage(PathCorrectedImage):
         import numpy as np
         from collections import deque
 
-        M_work    = M_free.copy()
+        M_work = M_free.copy()
         flat_to_k = {int(f): k for k, f in enumerate(free_idx)}
         merge_map = {}
         remove_k  = set()
@@ -482,11 +476,11 @@ class SDCorrectedImage(PathCorrectedImage):
                 f"d >= {d_bc_thresh:.2f} — nothing to merge.", flush=True)
             return M_free, free_idx, merge_map, keep
 
-        n_nodes   = len(nodes)
+        n_nodes = len(nodes)
         positions = np.array([pos for _, _, pos in nodes])   # (n_nodes, 2)
 
         # Build the weighted distance matrix
-        delta      = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+        delta = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
         dist_matrix = np.linalg.norm(delta, axis=-1)          # (n_nodes, n_nodes)
 
         # Build adjacency list
@@ -498,7 +492,7 @@ class SDCorrectedImage(PathCorrectedImage):
                     adjacency[b].append(a)
 
         # BFS to find connected components
-        visited    = [False] * n_nodes
+        visited = [False] * n_nodes
         components = []
 
         for start in range(n_nodes):
@@ -534,11 +528,11 @@ class SDCorrectedImage(PathCorrectedImage):
         for k in remove_k:
             keep[k] = False
 
-        M_free_bc   = M_work[:, keep]
+        M_free_bc = M_work[:, keep]
         free_idx_bc = free_idx[keep]
 
         n_merged = int(keep.size - keep.sum())
-        n_groups  = sum(1 for c in components if len(c) > 1)
+        n_groups = sum(1 for c in components if len(c) > 1)
         if n_merged:
             print(f"  Medial BC: merged {n_merged} follower knot(s) across "
                 f"{n_groups} component(s) → "
@@ -603,18 +597,18 @@ class SDCorrectedImage(PathCorrectedImage):
         from scipy.spatial import KDTree
         from collections import deque
 
-        M_work    = M_free.copy()
+        M_work = M_free.copy()
         flat_to_k = {int(f): k for k, f in enumerate(free_idx)}
         merge_map = {}
         remove_k  = set()
 
-        # ── 1. Build the seam pixel set ───────────────────────────────────────────
+        # Build the seam pixel set
         #
         # Pixels with s_norm near 0 or 1 lie in the Voronoi zone adjacent to the
         # discontinuity.  We restrict to the breast mask so we don't pick up the
         # zero-padded background.
 
-        mask   = self._sd_mask
+        mask = self._sd_mask
         s_norm = self._sd_s_norm
 
         seam_pixel_mask = mask & (
@@ -630,7 +624,7 @@ class SDCorrectedImage(PathCorrectedImage):
 
         seam_tree = KDTree(seam_pixels)
 
-        # ── 2. Find knots within seam_radius_px of the seam ──────────────────────
+        # Find knots within seam_radius_px of the seam
         #
         # For each free knot query the tree; candidates are grouped by depth j
         # so that only knots at the same depth level compete for merging.
@@ -651,7 +645,7 @@ class SDCorrectedImage(PathCorrectedImage):
                         (flat, flat_to_k[flat], pos)
                     )
 
-        # ── 3. BFS within each depth level to find connected components ───────────
+        # BFS within each depth level to find connected components
         #
         # Two candidate knots are connected if their mutual pixel distance is also
         # <= seam_radius_px.  Every component is merged into its first member
@@ -664,7 +658,7 @@ class SDCorrectedImage(PathCorrectedImage):
             if len(nodes) < 2:
                 continue
 
-            n_nodes   = len(nodes)
+            n_nodes = len(nodes)
             positions = np.array([pos for _, _, pos in nodes])
 
             # Pairwise distances among the candidates at this depth level
@@ -711,7 +705,7 @@ class SDCorrectedImage(PathCorrectedImage):
                 merged_depths.append((j, float(dc[j]), n_merged_j))
                 total_merged += n_merged_j
 
-        # ── 4. Build the reduced matrix and index array ───────────────────────────
+        # Build the reduced matrix and index array
 
         keep = np.ones(len(free_idx), dtype=bool)
         for k in remove_k:
@@ -784,25 +778,14 @@ class SDCorrectedImage(PathCorrectedImage):
         q_full[free_idx] = q
         q2d = q_full.reshape(ns, nd)
 
-        # ── Smoothness in q-space: R_smooth = (λ_s/K) · q^T L q ─────────────────
-        # Hessian: (2λ_s/K) · L  [constant, PSD]
-        # ds_ = np.diff(q2d, axis=0)
-        # dd_ = np.diff(q2d, axis=1)
-        # smooth_loss = lam_smooth * (np.sum(ds_**2) + np.sum(dd_**2)) / n_par
-        
-        # dq = np.zeros((ns, nd), dtype=np.float64)
-        # dq[1:,  :] += 2 * ds_;  dq[:-1, :] -= 2 * ds_
-        # dq[:,  1:] += 2 * dd_;  dq[:,  :-1] -= 2 * dd_
-        # g_smooth_q = dq.ravel()[free_idx] * lam_smooth / n_par
-
         ds_ = np.diff(q2d, axis=0)   # shape (ns-1, nd) — s-direction differences
         dd_ = np.diff(q2d, axis=1)   # shape (ns, nd-1) — d-direction differences
 
         # smooth_loss = (lam_smooth_s * np.sum(ds_**2) +
         #             lam_smooth_d * np.sum(dd_**2)) / n_par
-        smooth_loss_s = (lam_smooth_s * np.sum(ds_**2))/n_par
-        smooth_loss_d = (lam_smooth_d * np.sum(dd_**2)) / n_par
-        smooth_loss = smooth_loss_d+smooth_loss_s
+        smooth_loss_s = np.sum(ds_**2)/n_par
+        smooth_loss_d =  np.sum(dd_**2) / n_par
+        smooth_loss = lam_smooth_s * smooth_loss_d + lam_smooth_d *smooth_loss_s if not debug else smooth_loss_d+smooth_loss_s
 
         # s-direction gradient (axis=0): scale by lam_smooth_s
         dq_s = np.zeros((ns, nd), dtype=np.float64)
@@ -818,81 +801,15 @@ class SDCorrectedImage(PathCorrectedImage):
         g_smooth_q = (dq_s.ravel() * lam_smooth_s +
                     dq_d.ravel() * lam_smooth_d)[free_idx] / n_par
 
-        # ── Drift in q-space: R_drift = (λ_d/K_f) · ||q||^2 ─────────────────────
+        # Drift in q-space: R_drift = (λ_d/K_f) · ||q||^2
         # Hessian: (2λ_d/K_f) · I  [constant, PD]
-        drift_loss = lam_drift * np.mean(q**2)
+        drift_loss = np.mean(q**2)
+        drift_loss = lam_drift * drift_loss if not debug else drift_loss
         g_drift_q  = 2.0 * lam_drift * q / n_free
 
         if debug: return smooth_loss_s, smooth_loss_d, drift_loss
 
         return float(smooth_loss + drift_loss), (g_smooth_q + g_drift_q)
-
-
-
-    # def _hessp_std(self, q, vec, M_free, fixed_contrib, v_opt,
-    #             free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift, mu=0.0):
-
-    #     fp     = np.exp(q)
-    #     fv     = M_free @ fp + fixed_contrib
-    #     n_par  = ns * nd
-    #     n_free = len(free_idx)
-
-    #     mu_v    = v_opt.mean()
-    #     mu_vf   = (v_opt * fv).mean()
-    #     alpha   = mu_v / (mu_vf + 1e-12)
-    #     fv_norm = alpha * fv
-    #     u       = v_opt * fv_norm
-    #     mu_u    = u.mean()
-    #     N       = len(u)
-    #     sigma   = np.std(u) + 1e-12
-
-    #     g_data      = v_opt * (u - mu_u) / (N * sigma)
-    #     grad_data_p = alpha * (
-    #         M_free.T @ g_data
-    #         - (np.dot(fv_norm, g_data) / (N * mu_v)) * (M_free.T @ v_opt)
-    #     )
-
-    #     # ── p-space direction ────────────────────────────────────────────────────
-    #     p_vec = fp * vec
-
-    #     # ── Data Hessian-vector product (Gauss-Newton, p-space) ──────────────────
-    #     Mv    = M_free @ p_vec
-    #     term1 = (alpha**2 / (N * sigma))     * (M_free.T @ (v_opt**2 * Mv))
-    #     term2 = -(alpha**2 / (N**2 * sigma)) * (M_free.T @ v_opt) * (v_opt @ Mv)
-    #     term3 = -(alpha**2 / (N * sigma**2)) * (M_free.T @ (v_opt * (u - mu_u))) * (g_data @ Mv)
-    #     H_data_p_pvec = term1 + term2 + term3
-
-    #     # Convert data term to q-space: H^q z = p⊙(H^p(p⊙z)) + ∇_p L ⊙ p ⊙ z
-    #     H_data_q = fp * H_data_p_pvec + grad_data_p * fp * vec
-
-    #     # ── Asymmetric smoothness Hessian-vector product ──────────────────────────
-    #     # Expand vec into the full (ns, nd) grid, with fixed knots at 0.
-    #     v_full           = np.zeros(n_par, dtype=np.float64)
-    #     v_full[free_idx] = vec
-    #     v_grid           = v_full.reshape(ns, nd)
-
-    #     # s-direction: accumulate with lam_smooth_s
-    #     dvs    = np.diff(v_grid, axis=0)
-    #     dv_s   = np.zeros((ns, nd), dtype=np.float64)
-    #     dv_s[1:,  :] += 2 * dvs
-    #     dv_s[:-1, :] -= 2 * dvs
-
-    #     # d-direction: accumulate with lam_smooth_d
-    #     dvd    = np.diff(v_grid, axis=1)
-    #     dv_d   = np.zeros((ns, nd), dtype=np.float64)
-    #     dv_d[:,  1:] += 2 * dvd
-    #     dv_d[:,  :-1] -= 2 * dvd
-
-    #     # Combine with respective weights BEFORE indexing, mirroring _reg_and_grad
-    #     H_smooth_q = (dv_s.ravel() * lam_smooth_s +
-    #                 dv_d.ravel() * lam_smooth_d)[free_idx] / n_par
-
-    #     H_drift_q = 2.0 * lam_drift / n_free * vec
-
-    #     # μI is the LM shift; zero for Trust-NCG (default mu=0).
-    #     H_lm_q = mu * vec
-
-    #     return (H_data_q + H_smooth_q + H_drift_q + H_lm_q).astype(np.float64)
     
 
     def _hessp_std(self, q, vec, M_free, fixed_contrib, v_opt,
@@ -1068,37 +985,6 @@ class SDCorrectedImage(PathCorrectedImage):
             x=q, fun=float(f), jac=g,
             nit=nit, success=success, message=message,
         )
-
-
-    # def _objective_std(self, q, M_free, fixed_contrib, v_opt,
-    #                 free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift):
-    #     """
-    #     Standard deviation objective function for L-BFGS optimization.
-    #     """
-    #     fp      = np.exp(q)
-    #     fv      = M_free @ fp + fixed_contrib
-
-    #     mu_v    = v_opt.mean()
-    #     mu_vf   = (v_opt * fv).mean()
-    #     alpha   = mu_v / (mu_vf + 1e-12)
-    #     fv_norm = alpha * fv
-
-    #     corr  = v_opt * fv_norm
-    #     mu    = corr.mean()
-    #     nm    = len(corr)
-    #     sigma = np.std(corr)
-
-    #     g           = v_opt * (corr - mu) / (nm * sigma + 1e-12)
-    #     grad_data_p = alpha * (
-    #         M_free.T @ g
-    #         - (np.dot(fv_norm, g) / (nm * mu_v)) * (M_free.T @ v_opt)
-    #     )
-    #     grad_data_q = grad_data_p * fp
-
-    #     reg_loss, g_reg_q = self._reg_and_grad(
-    #         q, free_idx, ns, nd, lam_smooth_s, lam_smooth_d, lam_drift
-    #     )
-    #     return float(sigma) + reg_loss, (grad_data_q + g_reg_q).astype(np.float64)
 
     def _objective_std(self, q, M_free=None, fixed_contrib=None, v_opt=None,
                         free_idx=None, ns=None, nd=None,
@@ -1406,14 +1292,26 @@ class SDCorrectedImage(PathCorrectedImage):
         kx = min(3, ns - 1)
         ky = min(3, nd - 1)
 
-        if _q0 is not None:
-            _q0 = _q0[keep_cumulative]
+        # if _q0 is not None:
+        #     _q0 = _q0[keep_cumulative]
 
+        # if _q0 is not None:
+        #     q0 = _q0
+        # else:
+        #     p0 = np.clip(bin_grid.ravel()[free_idx].copy(), 1e-6, None)
+        #     q0 = np.log(p0)
         if _q0 is not None:
-            q0 = _q0
+            if len(_q0) == len(free_idx):
+                q0 = _q0   # already the right size
+            elif len(_q0) == keep_cumulative.size:
+                q0 = _q0[keep_cumulative]
+            else:
+                print(f"  WARNING: _q0 size {len(_q0)} does not match free_idx "
+                    f"size {len(free_idx)} or keep_cumulative size "
+                    f"{keep_cumulative.size}, ignoring warm start.", flush=True)
+                q0 = np.log(np.clip(bin_grid.ravel()[free_idx].copy(), 1e-6, None))
         else:
-            p0 = np.clip(bin_grid.ravel()[free_idx].copy(), 1e-6, None)
-            q0 = np.log(p0)
+            q0 = np.log(np.clip(bin_grid.ravel()[free_idx].copy(), 1e-6, None))
 
         def obj_fn(q):
             return self._objective_std(q, M_free, fixed_contrib, v_opt,
@@ -1434,7 +1332,7 @@ class SDCorrectedImage(PathCorrectedImage):
             )
 
         elif solver == 'lm':
-            # ── Levenberg–Marquardt ───────────────────────────────────────────────
+            # Levenberg–Marquardt
             # Determine initial damping μ₀.
             if lm_tau > 0.0:
                 # Scale by the gradient norm at the starting point so that μ₀
@@ -1491,21 +1389,323 @@ class SDCorrectedImage(PathCorrectedImage):
 
         return self._apply_field(field), field, result
     
+
+    def find_lcurve_corner(
+        self,
+        param = 'lam_drift',
+        lam0 = 0.6,
+        lam_smooth_s = 0.0,
+        lam_smooth_d = 0.0,
+        lam_drift = 0.6,
+        max_outer = 5,
+        outer_tol = 1e-2,
+        lam_min = 1e-4,
+        lam_max = 1e+1,
+        n_bundle = 15,
+        plot = False,
+        **kwargs
+    ):
+        """
+        Finds the L-curve corner using implicit differentiation.
+
+        At each outer iteration the inner optimization is solved once.
+        The sensitivity dq*/dlam is then used to linearize q*(lam) around
+        the current point, allowing cheap evaluation of the L-curve at a
+        bundle of nearby lambda values without re-solving the optimization.
+        The corner (maximum curvature) is found from those bundle points, and
+        the outer iteration moves to the corner lambda.
+
+        Parameters
+        ----------
+        param : str
+            Parameter to find corner for: 'lam_drift', 'lam_smooth_s',
+            'lam_smooth_d'.
+        lam0 : float
+            Initial lambda for the swept parameter.
+        lam_smooth_s, lam_smooth_d, lam_drift : float
+            Fixed values for the parameters that are not swept.
+        max_outer : int
+            Maximum number of outer iterations (default 10).
+        outer_tol : float
+            Convergence tolerance on lambda in log-space (default 1e-2).
+        lam_min, lam_max : float
+            Search bounds (default 1e-4, 1e3).
+        n_bundle : int
+            Number of lambda values in the linearized bundle per iteration
+            (default 15).
+        plot : bool
+            Whether to plot visited points (default True).
+        **kwargs
+            Passed through to correct_sd_optimized.
+        """
+        import matplotlib.pyplot as plt
+        from scipy.linalg import solve
+        import time
+
+        if param not in ('lam_drift', 'lam_smooth_s', 'lam_smooth_d'):
+            raise ValueError(
+                f"param must be 'lam_drift', 'lam_smooth_s', or 'lam_smooth_d';"
+                f" got '{param}'."
+            )
+
+        def _make_kws(lam):
+            kws = dict(lam_smooth_s=lam_smooth_s,
+                    lam_smooth_d=lam_smooth_d,
+                    lam_drift=lam_drift)
+            kws[param] = float(lam)
+            return kws
+
+        def _get_cache():
+            return next(reversed(self._opt_cache.values()))
+
+        def _form_hessian(q, kws):
+            c  = _get_cache()
+            ns, nd = len(c['sc']), len(c['dc'])
+            n  = len(q)
+            H  = np.zeros((n, n), dtype=np.float64)
+            e  = np.zeros(n,      dtype=np.float64)
+            for k in range(n):
+                e[k] = 1.0
+                H[:, k] = self._hessp_std(
+                    q, e,
+                    c['M_free'], c['fixed_contrib'], c['v_opt'],
+                    c['free_idx'], ns, nd,
+                    kws['lam_smooth_d'], kws['lam_smooth_s'], kws['lam_drift'],
+                    mu=0.0
+                )
+                e[k] = 0.0
+            return 0.5 * (H + H.T)
+
+        def _drhs_dlam(q, param):
+            c        = _get_cache()
+            free_idx = c['free_idx']
+            ns, nd   = len(c['sc']), len(c['dc'])
+            n_par    = ns * nd
+            n_free   = len(free_idx)
+
+            if param == 'lam_drift':
+                return (2.0 / n_free) * q
+
+            q_full = np.zeros(n_par)
+            q_full[free_idx] = q
+
+            if param == 'lam_smooth_s':
+                q2d = q_full.reshape(ns, nd)
+                ds_ = np.diff(q2d, axis=0)
+                dq  = np.zeros((ns, nd))
+                dq[1:,  :] += 2 * ds_
+                dq[:-1, :] -= 2 * ds_
+                return dq.ravel()[free_idx] / n_par
+
+            if param == 'lam_smooth_d':
+                q2d = q_full.reshape(ns, nd)
+                dd_ = np.diff(q2d, axis=1)
+                dq  = np.zeros((ns, nd))
+                dq[:,  1:] += 2 * dd_
+                dq[:, :-1] -= 2 * dd_
+                return dq.ravel()[free_idx] / n_par
+
+        def _eval_at_q(q, kws):
+            """Evaluate (sigma, reg_norm) at a given q without optimization."""
+            s, ss, sd, dr = self._objective_std(
+                q,
+                lam_smooth_s = kws['lam_smooth_s'],
+                lam_smooth_d = kws['lam_smooth_d'],
+                lam_drift    = kws['lam_drift'],
+                debug        = True,
+            )
+            return float(s), float(ss + sd + dr)
+
+        def _curvature(x, y):
+            """Signed curvature of a log-log curve given by arrays x, y."""
+            lx  = np.log(np.maximum(x, 1e-30))
+            ly  = np.log(np.maximum(y, 1e-30))
+            dx  = np.gradient(lx)
+            dy  = np.gradient(ly)
+            ddx = np.gradient(dx)
+            ddy = np.gradient(dy)
+            denom = (dx**2 + dy**2)**1.5
+            with np.errstate(invalid='ignore', divide='ignore'):
+                kappa = np.where(denom > 1e-30,
+                                (dx * ddy - dy * ddx) / denom, 0.0)
+            return kappa
+        
+        def _compute_sensitivity_cg(q, kws, param, cg_iters=250):
+            """
+            Approximates dq*/dlam by solving H * dq*/dlam = -rhs
+            using CG with _hessp_std as the implicit matvec.
+            """
+            from scipy.sparse.linalg import LinearOperator, cg as sparse_cg
+
+            c  = _get_cache()
+            ns, nd = len(c['sc']), len(c['dc'])
+            n  = len(q)
+
+            def matvec(v):
+                return self._hessp_std(
+                    q, v,
+                    c['M_free'], c['fixed_contrib'], c['v_opt'],
+                    c['free_idx'], ns, nd,
+                    kws['lam_smooth_d'], kws['lam_smooth_s'], kws['lam_drift'],
+                    mu=1e-6   # small Tikhonov shift for stability
+                )
+
+            A   = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
+            rhs = -_drhs_dlam(q, param)
+
+            dq_dlam, info = sparse_cg(A, rhs, maxiter=cg_iters, rtol=1e-3)
+            if info != 0:
+                print(f"  CG did not converge (info={info}), using approximate solution.",
+                    flush=True)
+            return dq_dlam
+
+        # Outer loop
+        lam   = float(lam0)
+        _q0   = None
+
+        # Accumulate all visited (sigma, reg, lam) across outer iterations
+        all_sigma = []
+        all_reg   = []
+        all_lam   = []
+
+        print(f"\nFinding L-curve corner for {param}", flush=True)
+
+        for outer in range(max_outer):
+            kws = _make_kws(lam)
+            print(f"\n[Outer {outer+1}/{max_outer}]  {param}={lam:.5g}",
+                flush=True)
+
+            # solve inner optimization (warm-started from previous lam)
+            optimization_kwargs = {
+                k:v
+                for k,v in kwargs.items()
+                if k not in kws.keys()
+            }
+            _, _, res = self.correct_sd_optimized(_q0=_q0, **kws, **optimization_kwargs)
+            q   = res.x
+            _q0 = q
+
+            # form Hessian and compute sensitivity
+            print("  Compute sensitivity…", flush=True)
+            t0 = time.time()
+            dq_dlam  = _compute_sensitivity_cg(q, kws, param)
+            print(f"  done in {(time.time()-t0):.1f}s")
+            
+            # build bundle of lambda values around current lam
+            # Use a log-spaced bundle clipped to [lam_min, lam_max]
+            log_lam  = np.log(lam)
+            log_span = min(0.75, 0.5 * np.log(lam_max / lam_min))
+            bundle_lams = np.exp(np.linspace(
+                max(np.log(lam_min), log_lam - log_span),
+                min(np.log(lam_max), log_lam + log_span),
+                n_bundle
+            ))
+
+            bundle_sigma = np.zeros(n_bundle)
+            bundle_reg   = np.zeros(n_bundle)
+
+            for fi, lam_f in enumerate(bundle_lams):
+                # q*(lam_f) ≈ q* + dq*/dlam * (lam_f - lam)
+                delta_lam = lam_f - lam
+                q_approx = q + dq_dlam * delta_lam
+                kws_f = _make_kws(lam_f)
+                bundle_sigma[fi], bundle_reg[fi] = _eval_at_q(q_approx, kws_f)
+
+            # find corner of the bundle curve via curvature
+            kappa = _curvature(bundle_sigma, bundle_reg)
+            # Ignore unreliable endpoints
+            kappa[0]  = -np.inf
+            kappa[-1] = -np.inf
+            corner_fi  = int(np.argmax(kappa))
+            lam_corner = float(bundle_lams[corner_fi])
+
+            # Record the bundle points
+            all_sigma.extend(bundle_sigma.tolist())
+            all_reg.extend(bundle_reg.tolist())
+            all_lam.extend(bundle_lams.tolist())
+
+            print(f"  bundle corner at {param}={lam_corner:.5g}  "
+                f"(kappa={kappa[corner_fi]:.4g})", flush=True)
+
+            # check convergence
+            dlam = abs(np.log(lam_corner) - np.log(lam))
+            print(f"  |Δlog(lam)| = {dlam:.4g}", flush=True)
+
+            lam = lam_corner
+            if dlam < outer_tol:
+                print(f"  Converged.", flush=True)
+                break
+
+        corner_lam = float(lam)
+        print(f"\nCorner: {param} = {corner_lam:.5g}", flush=True)
+
+        if plot:
+            # Sort by sigma for a clean curve
+            order = np.argsort(all_sigma)
+            s_pl  = np.array(all_sigma)[order]
+            r_pl  = np.array(all_reg)[order]
+            l_pl  = np.array(all_lam)[order]
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+            ax = axes[0]
+            ax.plot(s_pl, r_pl, 'o', color='steelblue', markersize=4, alpha=0.6)
+            # Annotate every other point to avoid crowding
+            for i in range(0, len(l_pl), max(1, len(l_pl)//20)):
+                ax.annotate(f"{l_pl[i]:.2g}", (s_pl[i], r_pl[i]),
+                            textcoords="offset points", xytext=(3, 3),
+                            fontsize=6)
+            # Mark the final corner
+            kws_c = _make_kws(corner_lam)
+            s_c, r_c = _eval_at_q(q + dq_dlam * (corner_lam - lam), kws_c)
+            ax.scatter([s_c], [r_c], color='red', zorder=5, s=80,
+                    label=f"corner: {param}={corner_lam:.3g}")
+            ax.set_xscale('log'); ax.set_yscale('log')
+            ax.set_xlabel(r'Data loss  $\sigma(q^*)$')
+            ax.set_ylabel(r'Regularization norm  $\mathcal{R}(q^*)$')
+            ax.set_title(f'L-curve  (implicit, {param})')
+            ax.legend(fontsize=9)
+
+            ax = axes[1]
+            ax.semilogy(range(1, outer + 2),
+                        [all_lam[i * n_bundle + n_bundle // 2]
+                        for i in range(outer + 1)],
+                        'o-', color='steelblue')
+            ax.axhline(corner_lam, color='red', linestyle='--',
+                    label=f'corner={corner_lam:.3g}')
+            ax.set_xlabel('Outer iteration')
+            ax.set_ylabel(param)
+            ax.set_title('Lambda convergence')
+            ax.legend(fontsize=9)
+
+            plt.tight_layout()
+            plt.show()
+
+        return {
+            'corner_lam'  : corner_lam,
+            'corner_q'    : q,
+            'all_lam'     : all_lam,
+            'all_sigma'   : all_sigma,
+            'all_reg'     : all_reg,
+        }
+
+
     def visualize_correction(
         self,
         field,
         corrected_image,
-        ns              = 18,
-        nd              = 13,
-        sc              = None,
-        dc              = None,
-        cmap_field      = 'RdBu_r',
-        field_vmin      = None,
-        field_vmax      = None,
-        figsize         = (22, 14),
-        save_path       = None,
-        dpi             = 150,
-        merge_map       = None,
+        ns = 18,
+        nd = 13,
+        sc = None,
+        dc = None,
+        cmap_field = 'RdBu_r',
+        field_vmin = None,
+        field_vmax = None,
+        figsize = (22, 14),
+        save_path = None,
+        dpi = 150,
+        merge_map = None,
+        title_addons = [],
         **kwargs
     ):
         """
@@ -1791,14 +1991,18 @@ class SDCorrectedImage(PathCorrectedImage):
         ax_profile.tick_params(labelsize=8)
         ax_profile.grid(True, linewidth=0.4, alpha=0.5)
 
+        first_vert = " | " if title_addons else ""
         fig.suptitle(
-            f'(s, d) Correction Result — spline grid {ns}x{nd}'
-            f' | field range [{f_masked.min():.3f}, {f_masked.max():.3f}]',
-            fontsize=13, fontweight='bold', y=1.01,
+            f'(s, d) Correction Result — spline grid {ns}x{nd}' +
+            f' | field range [{f_masked.min():.3f}, {f_masked.max():.3f}]' +
+            first_vert + 
+            " | ".join(title_addons),
+            fontsize=15, fontweight='bold', y=1.01,
         )
 
         if save_path:
             fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
             print(f'Saved to {save_path}')
-        plt.show()
-        return fig, (ax_orig, ax_corr, ax_field, ax_knots, ax_sd, ax_profile)
+        else:
+            plt.show()
+            return fig, (ax_orig, ax_corr, ax_field, ax_knots, ax_sd, ax_profile)
